@@ -946,10 +946,11 @@ function setupIpcHandlers() {
     prisma.$transaction(async (tx) => {
       const warehouse = await tx.warehouse.create({ data: { ...data, isDefault: false } })
       const products = await tx.product.findMany({ select: { id: true } })
-      if (products.length) {
-        await tx.warehouseStock.createMany({
-          data: products.map(product => ({ warehouseId: warehouse.id, productId: product.id, quantity: 0 })),
-          skipDuplicates: true,
+      for (const product of products) {
+        await tx.warehouseStock.upsert({
+          where: { warehouseId_productId: { warehouseId: warehouse.id, productId: product.id } },
+          update: {},
+          create: { warehouseId: warehouse.id, productId: product.id, quantity: 0 },
         })
       }
       return warehouse
@@ -1001,10 +1002,11 @@ function setupIpcHandlers() {
       const warehouse = await tx.warehouse.findUnique({ where: { id: warehouseId } })
       if (!warehouse) throw new Error('المخزن غير موجود')
       const products = await tx.product.findMany({ select: { id: true } })
-      if (products.length) {
-        await tx.warehouseStock.createMany({
-          data: products.map(product => ({ warehouseId, productId: product.id, quantity: 0 })),
-          skipDuplicates: true,
+      for (const product of products) {
+        await tx.warehouseStock.upsert({
+          where: { warehouseId_productId: { warehouseId, productId: product.id } },
+          update: {},
+          create: { warehouseId, productId: product.id, quantity: 0 },
         })
       }
       return products.length
