@@ -18,10 +18,15 @@ export default function Products() {
   const [priceHistoryProduct, setPriceHistoryProduct] = useState<Product | null>(null)
   const { settings } = useSettings()
 
-  const load = () => Promise.all([
-    window.api.products.getAll(showInactive),
-    window.api.categories.getAll(),
-  ]).then(([p, c]) => { setProducts(p); setCategories(c) })
+  const load = async () => {
+    await window.api.warehouses.init()
+    const [p, c] = await Promise.all([
+      window.api.products.getAll(showInactive),
+      window.api.categories.getAll(),
+    ])
+    setProducts(p)
+    setCategories(c)
+  }
 
   useEffect(() => { load() }, [showInactive])
 
