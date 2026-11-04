@@ -2287,74 +2287,156 @@ function setupIpcHandlers() {
   })
 
   // ─── SYSTEM ─────────────────────────────────────────────────────
-  ipcMain.handle('system:clearAllData', async (_, sections?: string[], password?: string) => {
-    const expected = await prisma.setting.findUnique({ where: { key: 'clearDataPassword' } })
-    const pw = expected?.value || 'admin'
-    if (password !== pw) throw new Error('كلمة المرور غير صحيحة')
-    const s = new Set(sections && sections.length ? sections : ['all'])
-    const all = s.has('all')
+  ipcMain.handle('system:clearAllData', async (_, payload: { sections: string[]; userId: number; pin: string }) => {
+    const { sections, userId, pin } = payload || {}
+    if (!Array.isArray(sections) || sections.length === 0) {
+      throw new Error('اختر قسمًا واحدًا على الأقل')
+    }
+    if (!Number.isInteger(userId) || typeof pin !== 'string' || !pin.trim()) {
+      throw new Error('أدخل رقم دخول المدير')
+    }
+
+    // Verify the manager against the database in the main process; never trust renderer state.
+    const actor = await prisma.user.findUnique({ where: { id: userId } })
+    if (!actor || !actor.isActive || actor.pin !== pin) {
+      throw new Error('رقم دخول المدير غير صحيح')
+    }
+    const role = await prisma.role.findUnique({ where: { name: actor.role } })
+    if (!role || (!role.isSystem && !role.fullAccess)) {
+      throw new Error('هذه العملية متاحة لمدير النظام فقط')
+    }
+
+    const allowed = new Set([
+      'all', 'sales', 'returns', 'purchases', 'stock', 'transfers',
+      'inventory', 'products', 'customers', 'suppliers', 'expenses',
+      'accounting', 'banks',
+    ])
+    const selected = new Set(sections)
+    for (const section of selected) {
+      if (!allowed.has(section)) throw new Error('قسم غير معروف: ' + section)
+    }
+    const all = selected.has('all')
+    if (all && selected.size !== 1) throw new Error('اختيار مسح الجميع لا يقبل أقسامًا إضافية')
+
+    // Removing products requires removing documents that have mandatory product
+    // foreign keys as well. This is intentionally explicit in the confirmation UI.
+    const removeProducts = all || selected.has('products')
+    const removeSales = all || selected.has('sales') || removeProducts
+    const removeReturns = all || selected.has('returns') || removeSales
+    const removePurchases = all || selected.has('purchases') || removeProducts
+    const removeStock = all || selected.has('stock') || removeProducts
+    const removeTransfers = all || selected.has('transfers') || removeProducts
+    const removeInventory = all || selected.has('inventory') || removeProducts
+    const removeExpenses = all || selected.has('expenses')
+    const removeBanks = all || selected.has('banks')
+    const removeAccounting = all || selected.has('accounting')
+
     await prisma.$transaction(async (tx) => {
-      if (all || s.has('sales')) {
+      if (removeReturns) {
         await tx.saleReturnItem.deleteMany({})
         await tx.saleReturn.deleteMany({})
+      }
+      if (removeSales) {
         await tx.posOrderItem.deleteMany({})
         await tx.posOrder.deleteMany({})
+        await tx.journalEntry.deleteMany({ where: { source: 'sale' } })
+      } else if (selected.has('returns')) {
+        // Return journal entries use the shared "sale" source in older database versions.
+        await tx.journalEntry.deleteMany({
+          where: { source: 'sale', description: { contains: 'مرتجع' } },
+        })
       }
-      if (all || s.has('returns')) {
-        await tx.saleReturnItem.deleteMany({})
-        await tx.saleReturn.deleteMany({})
-      }
-      if (all || s.has('purchases')) {
+
+      if (removePurchases) {
         await tx.purchaseItem.deleteMany({})
         await tx.purchaseInvoice.deleteMany({})
         await tx.purchaseRequestItem.deleteMany({})
         await tx.purchaseRequest.deleteMany({})
+        await tx.stockMovement.deleteMany({ where: { type: 'purchase' } })
+        await tx.journalEntry.deleteMany({ where: { source: 'purchase' } })
       }
-      if (all || s.has('stock') || s.has('products')) {
-        await tx.stockMovement.deleteMany({})
-        await tx.warehouseStock.deleteMany({})
-      }
-      if (all || s.has('transfers')) {
+
+      if (removeTransfers) {
         await tx.transferItem.deleteMany({})
         await tx.transfer.deleteMany({})
         await tx.transferRequestItem.deleteMany({})
         await tx.transferRequest.deleteMany({})
+        await tx.stockMovement.deleteMany({ where: { type: 'transfer' } })
       }
-      if (all || s.has('inventory')) {
+
+      if (removeInventory) {
         await tx.inventoryCountItem.deleteMany({})
         await tx.inventoryCount.deleteMany({})
       }
-      if (all || s.has('products')) {
+
+      if (removeStock) {
+        await tx.stockMovement.deleteMany({})
+        await tx.warehouseStock.deleteMany({})
+        if (!removeProducts) {
+          await tx.product.updateMany({ data: { currentStock: 0 } })
+        }
+      }
+
+      if (removeProducts) {
+        await tx.promotionProduct.deleteMany({})
+        await tx.promotion.deleteMany({})
         await tx.productBarcode.deleteMany({})
         await tx.productUnit.deleteMany({})
+        await tx.priceHistory.deleteMany({})
         await tx.product.deleteMany({})
         await tx.category.deleteMany({})
-        await tx.priceHistory.deleteMany({})
       }
-      if (all || s.has('customers')) {
+
+      if (all || selected.has('customers')) {
+        // Preserve sales documents when only the customer master data is cleared.
+        await tx.posOrder.updateMany({ data: { customerId: null } })
         await tx.customer.deleteMany({})
       }
-      if (all || s.has('suppliers')) {
+
+      if (all || selected.has('suppliers')) {
+        // Supplier references are optional; detach them before removing suppliers.
+        await tx.purchaseInvoice.updateMany({ data: { supplierId: null } })
+        await tx.purchaseRequest.updateMany({ data: { supplierId: null } })
         await tx.supplier.deleteMany({})
       }
-      if (all || s.has('expenses')) {
+
+      if (removeExpenses) {
         await tx.expense.deleteMany({})
         await tx.expenseCategory.deleteMany({})
+        await tx.journalEntry.deleteMany({ where: { source: 'expense' } })
       }
-      if (all || s.has('accounting')) {
+
+      if (removeBanks) {
+        await tx.bankTransaction.deleteMany({})
+        await tx.bankStatementLine.deleteMany({})
+        await tx.bankRule.deleteMany({})
+        await tx.journalEntry.deleteMany({ where: { source: 'bank' } })
+        await tx.bankAccount.updateMany({ data: { accountId: null } })
+        await tx.bankAccount.deleteMany({})
+      }
+
+      if (removeAccounting) {
         await tx.journalEntryLine.deleteMany({})
         await tx.journalEntry.deleteMany({})
       }
-      if (all || s.has('banks')) {
-        await tx.bankTransaction.deleteMany({})
-        await tx.bankStatementLine.deleteMany({})
-        await tx.bankAccount.deleteMany({})
-      }
+
       if (all) {
         await tx.activityLog.deleteMany({})
       }
     })
-    try { await prisma.activityLog.create({ data: { userId: 1, action: 'clear', entity: 'system', details: (sections && sections.length ? sections.join(',') : 'all') } }) } catch {}
+
+    try {
+      await prisma.activityLog.create({
+        data: {
+          userId: actor.id,
+          action: 'clear',
+          entity: 'system',
+          details: all ? 'all' : [...selected].join(','),
+        },
+      })
+    } catch (error) {
+      console.error('[AuditLog:clear]', error)
+    }
     return { ok: true }
   })
 
