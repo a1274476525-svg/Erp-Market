@@ -463,17 +463,19 @@ function setupIpcHandlers() {
   )
 
   ipcMain.handle('invoices:confirmDraft', async (_, id: number) => {
-    const current = await prisma.purchaseInvoice.findUnique({ where: { id } })
-    if (!current) throw new Error('الفاتورة غير موجودة')
-    if (current.status !== 'draft') throw new Error('الفاتورة ليست في حالة مسودة')
-
     const invoice = await prisma.$transaction(async (tx) => {
-      const inv = await tx.purchaseInvoice.update({
-        where: { id },
+      const claimed = await tx.purchaseInvoice.updateMany({
+        where: { id, status: 'draft' },
         data: { status: 'confirmed' },
+      })
+      if (claimed.count !== 1) throw new Error('الفاتورة غير موجودة أو تم تأكيدها مسبقًا')
+      const inv = await tx.purchaseInvoice.findUnique({
+        where: { id },
         include: { items: true },
       })
+      if (!inv) throw new Error('الفاتورة غير موجودة')
       for (const item of inv.items) {
+        if (!Number.isFinite(item.quantity) || item.quantity <= 0) throw new Error('كمية شراء غير صالحة')
         await tx.product.update({
           where: { id: item.productId },
           data: { currentStock: { increment: item.quantity }, costPrice: item.unitPrice },
@@ -923,67 +925,112 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('transfers:execute', async (_, requestId: number) => {
-    const req = await prisma.transferRequest.findUnique({
-      where: { id: requestId },
-      include: { items: true },
+  ipcMain.handle('transfers:execute', async (_, requestId: number) =>
+    prisma.$transaction(async (tx) => {
+      const req = await tx.transferRequest.findUnique({
+        where: { id: requestId },
+        include: { items: true, transfer: true },
+      })
+      if (!req) throw new Error('طلب التحويل غير موجود')
+      if (req.transfer || req.status === 'transferred') throw new Error('تم تنفيذ طلب التحويل بالفعل')
+      if (req.fromWarehouseId === req.toWarehouseId) throw new Error('لا يمكن التحويل إلى نفس المخزن')
+      if (req.items.length === 0) throw new Error('طلب التحويل لا يحتوي على أصناف')
+
+      const maxTransfer = await tx.transfer.aggregate({ _max: { id: true } })
+      const ref = `TRF-${String((maxTransfer._max.id ?? 0) + 1).padStart(5, '0')}`
+      const transfer = await tx.transfer.create({
+        data: {
+          referenceNumber: ref,
+          requestId,
+          fromWarehouseId: req.fromWarehouseId,
+          toWarehouseId: req.toWarehouseId,
+          items: { create: req.items.map(i => ({ productId: i.productId, quantity: i.quantity })) },
+        },
+        include: { items: true },
+      })
+
+      for (const item of transfer.items) {
+        if (!Number.isFinite(item.quantity) || item.quantity <= 0) throw new Error('كمية تحويل غير صالحة')
+        const deducted = await tx.warehouseStock.updateMany({
+          where: {
+            warehouseId: req.fromWarehouseId,
+            productId: item.productId,
+            quantity: { gte: item.quantity },
+          },
+          data: { quantity: { decrement: item.quantity } },
+        })
+        if (deducted.count !== 1) throw new Error('المخزون غير كافٍ في المخزن المصدر')
+        await tx.warehouseStock.upsert({
+          where: { warehouseId_productId: { warehouseId: req.toWarehouseId, productId: item.productId } },
+          update: { quantity: { increment: item.quantity } },
+          create: { warehouseId: req.toWarehouseId, productId: item.productId, quantity: item.quantity },
+        })
+      }
+      await tx.transferRequest.update({ where: { id: requestId }, data: { status: 'transferred' } })
+      return transfer
     })
-    if (!req) throw new Error('Request not found')
+  )
 
-    const count = await prisma.transfer.count()
-    const ref   = `TRF-${String(count + 1).padStart(5, '0')}`
-
-    const transfer = await prisma.transfer.create({
-      data: {
-        referenceNumber: ref,
-        requestId,
-        fromWarehouseId: req.fromWarehouseId,
-        toWarehouseId:   req.toWarehouseId,
-        items: { create: req.items.map(i => ({ productId: i.productId, quantity: i.quantity })) },
-      },
-      include: { items: true },
+  ipcMain.handle('transfers:createDirect', async (_, { items, ...data }) =>
+    prisma.$transaction(async (tx) => {
+      if (!Array.isArray(items) || items.length === 0) throw new Error('أضف أصناف التحويل')
+      if (data.fromWarehouseId === data.toWarehouseId) throw new Error('لا يمكن التحويل إلى نفس المخزن')
+      const maxTransfer = await tx.transfer.aggregate({ _max: { id: true } })
+      const ref = `TRF-${String((maxTransfer._max.id ?? 0) + 1).padStart(5, '0')}`
+      const transfer = await tx.transfer.create({
+        data: { ...data, referenceNumber: ref, items: { create: items } },
+        include: { items: true },
+      })
+      for (const item of transfer.items) {
+        if (!Number.isFinite(item.quantity) || item.quantity <= 0) throw new Error('كمية تحويل غير صالحة')
+        const deducted = await tx.warehouseStock.updateMany({
+          where: {
+            warehouseId: data.fromWarehouseId,
+            productId: item.productId,
+            quantity: { gte: item.quantity },
+          },
+          data: { quantity: { decrement: item.quantity } },
+        })
+        if (deducted.count !== 1) throw new Error('المخزون غير كافٍ في المخزن المصدر')
+        await tx.warehouseStock.upsert({
+          where: { warehouseId_productId: { warehouseId: data.toWarehouseId, productId: item.productId } },
+          update: { quantity: { increment: item.quantity } },
+          create: { warehouseId: data.toWarehouseId, productId: item.productId, quantity: item.quantity },
+        })
+      }
+      return transfer
     })
+  )
 
-    for (const item of transfer.items) {
-      await prisma.warehouseStock.upsert({
-        where: { warehouseId_productId: { warehouseId: req.fromWarehouseId, productId: item.productId } },
-        update: { quantity: { decrement: item.quantity } },
-        create: { warehouseId: req.fromWarehouseId, productId: item.productId, quantity: -item.quantity },
-      })
-      await prisma.warehouseStock.upsert({
-        where: { warehouseId_productId: { warehouseId: req.toWarehouseId, productId: item.productId } },
-        update: { quantity: { increment: item.quantity } },
-        create: { warehouseId: req.toWarehouseId, productId: item.productId, quantity: item.quantity },
-      })
-    }
-    await prisma.transferRequest.update({ where: { id: requestId }, data: { status: 'transferred' } })
-    return transfer
-  })
-
-  ipcMain.handle('transfers:createDirect', async (_, { items, ...data }) => {
-    const count = await prisma.transfer.count()
-    const ref   = `TRF-${String(count + 1).padStart(5, '0')}`
-    const transfer = await prisma.transfer.create({
-      data: { ...data, referenceNumber: ref, items: { create: items } },
-      include: { items: true },
+  ipcMain.handle('transfers:delete', async (_, id: number) =>
+    prisma.$transaction(async (tx) => {
+      const transfer = await tx.transfer.findUnique({ where: { id }, include: { items: true } })
+      if (!transfer) throw new Error('التحويل غير موجود')
+      for (const item of transfer.items) {
+        const deducted = await tx.warehouseStock.updateMany({
+          where: {
+            warehouseId: transfer.toWarehouseId,
+            productId: item.productId,
+            quantity: { gte: item.quantity },
+          },
+          data: { quantity: { decrement: item.quantity } },
+        })
+        if (deducted.count !== 1) throw new Error('لا يمكن حذف التحويل: الكمية لم تعد متاحة في المخزن المستلم')
+        await tx.warehouseStock.upsert({
+          where: { warehouseId_productId: { warehouseId: transfer.fromWarehouseId, productId: item.productId } },
+          update: { quantity: { increment: item.quantity } },
+          create: { warehouseId: transfer.fromWarehouseId, productId: item.productId, quantity: item.quantity },
+        })
+      }
+      const deleted = await tx.transfer.delete({ where: { id } })
+      if (transfer.requestId) {
+        await tx.transferRequest.update({
+          where: { id: transfer.requestId },
+          data: { status: 'approved' },
+        })
+      }
+      return deleted
     })
-    for (const item of transfer.items) {
-      await prisma.warehouseStock.upsert({
-        where: { warehouseId_productId: { warehouseId: data.fromWarehouseId, productId: item.productId } },
-        update: { quantity: { decrement: item.quantity } },
-        create: { warehouseId: data.fromWarehouseId, productId: item.productId, quantity: -item.quantity },
-      })
-      await prisma.warehouseStock.upsert({
-        where: { warehouseId_productId: { warehouseId: data.toWarehouseId, productId: item.productId } },
-        update: { quantity: { increment: item.quantity } },
-        create: { warehouseId: data.toWarehouseId, productId: item.productId, quantity: item.quantity },
-      })
-    }
-    return transfer
-  })
-
-  ipcMain.handle('transfers:delete', (_, id: number) =>
-    prisma.transfer.delete({ where: { id } })
   )
 
   // ─── INVENTORY COUNT ───────────────────────────────────────────
@@ -1578,10 +1625,22 @@ function setupIpcHandlers() {
   })
 
   ipcMain.handle('journalEntries:post', async (_, id: number) => {
-    const entry = await prisma.journalEntry.findUnique({ where: { id } })
+    const entry = await prisma.journalEntry.findUnique({
+      where: { id },
+      include: { lines: true },
+    })
     if (!entry) throw new Error('القيد غير موجود')
     if (entry.status === 'posted') throw new Error('القيد مرحل مسبقاً')
-    return prisma.journalEntry.update({ where: { id }, data: { status: 'posted' } })
+    if (entry.lines.length < 2) throw new Error('لا يمكن ترحيل قيد بدون طرفين على الأقل')
+    const debit = entry.lines.reduce((sum, line) => sum + line.debit, 0)
+    const credit = entry.lines.reduce((sum, line) => sum + line.credit, 0)
+    if (Math.abs(debit - credit) > 0.005) throw new Error('القيد غير متوازن: إجمالي المدين لا يساوي إجمالي الدائن')
+    const updated = await prisma.journalEntry.updateMany({
+      where: { id, status: 'draft' },
+      data: { status: 'posted' },
+    })
+    if (updated.count !== 1) throw new Error('تعذر ترحيل القيد؛ ربما تم ترحيله بالفعل')
+    return prisma.journalEntry.findUnique({ where: { id }, include: { lines: { include: { account: true } } } })
   })
 
   ipcMain.handle('journalEntries:delete', async (_, id: number) => {
