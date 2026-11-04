@@ -899,6 +899,15 @@ function setupIpcHandlers() {
     })
   )
 
+  ipcMain.handle('branches:setDefault', async (_, id: number) =>
+    prisma.$transaction(async (tx) => {
+      const branch = await tx.branch.findUnique({ where: { id } })
+      if (!branch) throw new Error('الفرع غير موجود')
+      await tx.branch.updateMany({ data: { isDefault: false } })
+      return tx.branch.update({ where: { id }, data: { isDefault: true } })
+    })
+  )
+
   ipcMain.handle('branches:update', (_, { id, ...data }) =>
     prisma.branch.update({ where: { id }, data })
   )
