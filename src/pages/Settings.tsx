@@ -158,7 +158,7 @@ export default function SettingsPage() {
                 inputMode="numeric"
                 maxLength={4}
                 value={clearPassword}
-                onChange={e => { setClearPassword(e.target.value); setClearError('') }}
+                onChange={e => { setClearPassword(e.target.value.replace(/\\D/g, '').slice(0, 4)); setClearError('') }}
                 autoComplete="current-password"
                 placeholder="أدخل رقم دخول المدير"
                 disabled={clearing}
