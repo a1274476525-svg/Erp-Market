@@ -242,6 +242,7 @@ function setupIpcHandlers() {
     const [group, action] = channel.split(':')
     if (group === 'pos' && action === 'voidOrder') return ['/sales', '/pos']
     if (group === 'pos' && action === 'createReturn') return ['/returns', '/pos']
+    if (group === 'stock' && action === 'waste') return ['/waste', '/stock']
     const paths: Record<string, string[]> = {
       products: ['/products'], productBarcodes: ['/products'], productUnits: ['/products'],
       categories: ['/categories'], customers: ['/customers'], suppliers: ['/suppliers'],
