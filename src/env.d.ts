@@ -208,7 +208,7 @@ interface Window {
       get: (params?: { from?: string; to?: string }) => Promise<any>
     }
     system: {
-      clearAllData: (sections?: string[], password?: string) => Promise<{ ok: boolean }>
+      clearAllData: (sections: string[], userId: number, pin: string) => Promise<{ ok: boolean }>
       autoBackupStatus: () => Promise<Record<string, string>>
     }
   }
