@@ -771,6 +771,13 @@ function setupIpcHandlers() {
     return ret
   })
 
+  ipcMain.handle('pos:getReturns', () =>
+    prisma.saleReturn.findMany({
+      include: { order: true, items: { include: { product: true } } },
+      orderBy: { returnDate: 'desc' },
+    })
+  )
+
   // ─── STOCK ─────────────────────────────────────────────────────
   ipcMain.handle('stock:getMovements', (_, productId?: number) =>
     prisma.stockMovement.findMany({
