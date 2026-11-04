@@ -19,6 +19,7 @@ console.log('[DB]', dbUrl)
 const prisma = new PrismaClient()
 
 let mainWindow: BrowserWindow | null = null
+const clearPinFailures = new Map<number, { count: number; lockedUntil: number }>()
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -2296,11 +2297,23 @@ function setupIpcHandlers() {
       throw new Error('أدخل رقم دخول المدير')
     }
 
-    // Verify the manager against the database in the main process; never trust renderer state.
+    // Slow repeated PIN guesses and verify credentials against the database in the main process.
+    const now = Date.now()
+    const failure = clearPinFailures.get(userId)
+    if (failure && failure.lockedUntil > now) {
+      const seconds = Math.ceil((failure.lockedUntil - now) / 1000)
+      throw new Error(`محاولات كثيرة. حاول مرة أخرى بعد ${seconds} ثانية`)
+    }
     const actor = await prisma.user.findUnique({ where: { id: userId } })
     if (!actor || !actor.isActive || actor.pin !== pin) {
-      throw new Error('رقم دخول المدير غير صحيح')
+      const count = (failure?.count ?? 0) + 1
+      clearPinFailures.set(userId, {
+        count: count >= 5 ? 0 : count,
+        lockedUntil: count >= 5 ? now + 60_000 : 0,
+      })
+      throw new Error(count >= 5 ? 'تم إيقاف المحاولة مؤقتًا لمدة دقيقة' : 'رقم دخول المدير غير صحيح')
     }
+    clearPinFailures.delete(userId)
     const role = await prisma.role.findUnique({ where: { name: actor.role } })
     if (!role || (!role.isSystem && !role.fullAccess)) {
       throw new Error('هذه العملية متاحة لمدير النظام فقط')
