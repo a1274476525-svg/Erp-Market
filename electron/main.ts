@@ -247,6 +247,29 @@ function setupIpcHandlers() {
         data: { name: 'المخزن الرئيسي', branchId: branch.id, isDefault: true },
       })
     }
+
+    const migration = await tx.setting.findUnique({ where: { key: 'warehouseStockMigrationV1' } })
+    if (!migration) {
+      const products = await tx.product.findMany({ select: { id: true, currentStock: true } })
+      for (const product of products) {
+        const total = await tx.warehouseStock.aggregate({
+          where: { productId: product.id },
+          _sum: { quantity: true },
+        })
+        // Preserve legacy balances exactly once when upgrading from global-only stock.
+        if ((total._sum.quantity ?? 0) === 0 && product.currentStock > 0) {
+          await tx.warehouseStock.upsert({
+            where: { warehouseId_productId: { warehouseId: warehouse.id, productId: product.id } },
+            update: { quantity: product.currentStock },
+            create: { warehouseId: warehouse.id, productId: product.id, quantity: product.currentStock },
+          })
+        }
+        await refreshProductStock(tx, product.id)
+      }
+      await tx.setting.create({
+        data: { key: 'warehouseStockMigrationV1', value: new Date().toISOString() },
+      })
+    }
     return warehouse
   }
 
@@ -938,24 +961,8 @@ function setupIpcHandlers() {
   // ─── WAREHOUSES ────────────────────────────────────────────────
   ipcMain.handle('warehouses:init', async () =>
     prisma.$transaction(async (tx) => {
-      const warehouse = await getDefaultWarehouse(tx)
-      const products = await tx.product.findMany({ select: { id: true, currentStock: true } })
-      for (const product of products) {
-        const total = await tx.warehouseStock.aggregate({
-          where: { productId: product.id },
-          _sum: { quantity: true },
-        })
-        // One-time compatibility bridge for databases that only had Product.currentStock.
-        // Once any warehouse has stock, warehouse balances become the source of truth.
-        if ((total._sum.quantity ?? 0) === 0 && product.currentStock > 0) {
-          await tx.warehouseStock.upsert({
-            where: { warehouseId_productId: { warehouseId: warehouse.id, productId: product.id } },
-            update: { quantity: product.currentStock },
-            create: { warehouseId: warehouse.id, productId: product.id, quantity: product.currentStock },
-          })
-        }
-        await refreshProductStock(tx, product.id)
-      }
+      await getDefaultWarehouse(tx)
+      return true
     })
   )
 
