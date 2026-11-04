@@ -56,7 +56,7 @@ export default function Branches() {
                   <div className="flex items-center gap-2">
                     {b.isDefault && <Badge label="رئيسي" color="emerald" />}
                     {!b.isDefault && (
-                      <button onClick={() => window.api.branches.setDefault(b.id).then(load)}
+                      <button onClick={() => window.api.branches.setDefault(b.id).then(load).catch((error: any) => alert(error.message || 'تعذر تغيير الفرع الرئيسي'))}
                         className="text-xs px-2 py-1 text-emerald-600 hover:bg-emerald-50 rounded">
                         تعيين كفرع رئيسي
                       </button>
@@ -87,11 +87,13 @@ export default function Branches() {
                 <div className="flex justify-between items-start">
                   <div>
                     <div className="font-semibold text-slate-800">{w.name}</div>
-                    <div className="text-xs text-slate-400 mt-1">{w.branch?.name}</div>
+                    <div className="text-xs text-slate-400 mt-1">
+                      {w.branch?.name} · {(w.stocks ?? []).reduce((sum: number, stock: any) => sum + stock.quantity, 0).toLocaleString('ar-EG')} وحدة مخزنية
+                    </div>
                   </div>
                   <div className="flex items-center gap-2">
                     {w.isDefault && <Badge label="افتراضي" color="blue" />}
-                    <button onClick={() => window.api.warehouses.setDefault(w.id).then(load)}
+                    <button onClick={() => window.api.warehouses.setDefault(w.id).then(load).catch((error: any) => alert(error.message || 'تعذر تغيير المخزن الافتراضي'))}
                       className="text-xs px-2 py-1 text-blue-600 hover:bg-blue-50 rounded">
                       {!w.isDefault && 'تعيين افتراضي'}
                     </button>
