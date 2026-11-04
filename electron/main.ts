@@ -2566,7 +2566,7 @@ function setupIpcHandlers() {
       if (all) {
         await tx.activityLog.deleteMany({})
       }
-    })
+    }, { maxWait: 10_000, timeout: 60_000 })
 
     try {
       await prisma.activityLog.create({
