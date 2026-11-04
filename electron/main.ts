@@ -1877,46 +1877,49 @@ function setupIpcHandlers() {
   }) {
     const { bankAccountId, type, amount, description, referenceNumber, contraAccountId } = opts
     const date = opts.date ?? new Date()
-    const bankAcc = await prisma.bankAccount.findUnique({ where: { id: bankAccountId } })
-    if (!bankAcc) throw new Error('الحساب غير موجود')
-    const delta      = type === 'deposit' ? amount : -amount
-    const newBalance = bankAcc.currentBalance + delta
-    await prisma.bankAccount.update({ where: { id: bankAccountId }, data: { currentBalance: newBalance } })
+    if (!Number.isFinite(amount) || amount <= 0) throw new Error('قيمة المعاملة يجب أن تكون أكبر من صفر')
+    if (!['deposit', 'withdrawal', 'transfer'].includes(type)) throw new Error('نوع المعاملة غير صالح')
 
-    let journalEntryId: number | null = null
-    if (bankAcc.accountId && contraAccountId) {
-      const jeNumber = await nextJENumber()
-      const isDeposit = type === 'deposit'
-      const je = await prisma.journalEntry.create({
-        data: {
-          number: jeNumber,
-          date,
-          description: description || `${isDeposit ? 'إيداع' : 'سحب'} - ${bankAcc.name}`,
-          status: 'posted',
-          source: 'bank',
-          sourceId: bankAccountId,
-          lines: {
-            create: [
-              // DR side
-              { accountId: isDeposit ? bankAcc.accountId : contraAccountId, debit: amount, credit: 0, description },
-              // CR side
-              { accountId: isDeposit ? contraAccountId : bankAcc.accountId, debit: 0, credit: amount, description },
-            ],
+    return prisma.$transaction(async (tx) => {
+      const bankAcc = await tx.bankAccount.findUnique({ where: { id: bankAccountId } })
+      if (!bankAcc) throw new Error('الحساب غير موجود')
+      const delta = type === 'deposit' ? amount : -amount
+      const newBalance = bankAcc.currentBalance + delta
+      await tx.bankAccount.update({ where: { id: bankAccountId }, data: { currentBalance: newBalance } })
+
+      let journalEntryId: number | null = null
+      if (bankAcc.accountId && contraAccountId) {
+        const jeNumber = await nextJENumber()
+        const isDeposit = type === 'deposit'
+        const je = await tx.journalEntry.create({
+          data: {
+            number: jeNumber,
+            date,
+            description: description || `${isDeposit ? 'إيداع' : 'سحب'} - ${bankAcc.name}`,
+            status: 'posted',
+            source: 'bank',
+            sourceId: bankAccountId,
+            lines: {
+              create: [
+                { accountId: isDeposit ? bankAcc.accountId : contraAccountId, debit: amount, credit: 0, description },
+                { accountId: isDeposit ? contraAccountId : bankAcc.accountId, debit: 0, credit: amount, description },
+              ],
+            },
           },
-        },
-      })
-      journalEntryId = je.id
-    }
+        })
+        journalEntryId = je.id
+      }
 
-    return prisma.bankTransaction.create({
-      data: {
-        bankAccountId, type, amount, balanceAfter: newBalance,
-        description: description ?? null, referenceNumber: referenceNumber ?? null,
-        contraAccountId: contraAccountId ?? null,
-        journalEntryId,
-        date,
-      },
-      include: { bankAccount: { include: { account: true } } },
+      return tx.bankTransaction.create({
+        data: {
+          bankAccountId, type, amount, balanceAfter: newBalance,
+          description: description ?? null, referenceNumber: referenceNumber ?? null,
+          contraAccountId: contraAccountId ?? null,
+          journalEntryId,
+          date,
+        },
+        include: { bankAccount: { include: { account: true } } },
+      })
     })
   }
 
@@ -1927,20 +1930,25 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('bankTransactions:delete', async (_, id: number) => {
-    const tx = await prisma.bankTransaction.findUnique({ where: { id } })
-    if (!tx) throw new Error('المعاملة غير موجودة')
-    const delta = tx.type === 'deposit' ? -tx.amount : tx.amount
-    await prisma.bankAccount.update({ where: { id: tx.bankAccountId }, data: { currentBalance: { increment: delta } } })
-    if (tx.journalEntryId) {
-      await prisma.journalEntry.delete({ where: { id: tx.journalEntryId } }).catch(() => {})
-    }
-    await prisma.bankStatementLine.updateMany({
-      where: { matchedTransactionId: id },
-      data: { matchedTransactionId: null, status: 'unmatched' },
+  ipcMain.handle('bankTransactions:delete', async (_, id: number) =>
+    prisma.$transaction(async (tx) => {
+      const transaction = await tx.bankTransaction.findUnique({ where: { id } })
+      if (!transaction) throw new Error('المعاملة غير موجودة')
+      const delta = transaction.type === 'deposit' ? -transaction.amount : transaction.amount
+      await tx.bankAccount.update({
+        where: { id: transaction.bankAccountId },
+        data: { currentBalance: { increment: delta } },
+      })
+      if (transaction.journalEntryId) {
+        await tx.journalEntry.delete({ where: { id: transaction.journalEntryId } })
+      }
+      await tx.bankStatementLine.updateMany({
+        where: { matchedTransactionId: id },
+        data: { matchedTransactionId: null, status: 'unmatched' },
+      })
+      return tx.bankTransaction.delete({ where: { id } })
     })
-    return prisma.bankTransaction.delete({ where: { id } })
-  })
+  )
 
   // ─── BANK STATEMENT IMPORT & RECONCILIATION ───────────────────
   function detectColumn(headers: string[], candidates: string[]): number {
