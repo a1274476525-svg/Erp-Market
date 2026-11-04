@@ -18,6 +18,21 @@ console.log('[DB]', dbUrl)
 
 const prisma = new PrismaClient()
 
+async function ensureDatabaseFile() {
+  const { access, copyFile, mkdir } = await import('node:fs/promises')
+  try {
+    await access(dbPath)
+    return
+  } catch {
+    // A fresh installation receives an empty, schema-initialized SQLite database.
+  }
+  if (isDev) return
+  const seedPath = path.join(process.resourcesPath, 'prisma', 'umarket.db')
+  await mkdir(path.dirname(dbPath), { recursive: true })
+  await copyFile(seedPath, dbPath)
+  console.log('[DB] Initialized user database from packaged schema')
+}
+
 let mainWindow: BrowserWindow | null = null
 const clearPinFailures = new Map<number, { count: number; lockedUntil: number }>()
 const loginPinFailures = new Map<number, { count: number; lockedUntil: number }>()
@@ -104,6 +119,7 @@ async function checkAutoBackup() {
 }
 
 app.whenReady().then(async () => {
+  await ensureDatabaseFile()
   await ensureSystemRole()
   await checkAutoBackup()
   createWindow()
