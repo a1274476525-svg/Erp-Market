@@ -2,10 +2,12 @@ import { useState } from 'react'
 import { Settings, Save, FolderOpen } from 'lucide-react'
 import { Modal } from '../components/ui'
 import { useSettings } from '../contexts/SettingsContext'
+import { useAuth } from '../contexts/AuthContext'
 import type { AppSettings } from '../types'
 
 export default function SettingsPage() {
   const { settings, setSetting } = useSettings()
+  const { user } = useAuth()
   const [form, setForm]   = useState<AppSettings>({ ...settings })
   const [saving, setSaving]   = useState(false)
   const [saved, setSaved]     = useState(false)
@@ -136,49 +138,56 @@ export default function SettingsPage() {
         }}>
           <div className="space-y-3">
             <label className="flex items-center gap-2 text-sm font-medium">
-              <input type="checkbox" checked={clearSections.length === 12}
-                onChange={e => setClearSections(e.target.checked ? ['sales','returns','purchases','stock','transfers','inventory','products','customers','suppliers','expenses','accounting','banks'] : [])} />
+              <input type="checkbox" checked={clearSections.length === 1 && clearSections[0] === 'all'}
+                onChange={e => setClearSections(e.target.checked ? ['all'] : [])} />
               مسح الجميع
             </label>
             <div className="space-y-1 border-t pt-2">
               {['sales','returns','purchases','stock','transfers','inventory','products','customers','suppliers','expenses','accounting','banks'].map(sec => (
                 <label key={sec} className="flex items-center gap-2 text-sm">
                   <input type="checkbox" checked={clearSections.includes(sec)}
-                    onChange={e => setClearSections(prev => e.target.checked ? [...prev, sec] : prev.filter(x => x !== sec))} />
+                    onChange={e => setClearSections(prev => e.target.checked ? [...prev.filter(x => x !== 'all'), sec] : prev.filter(x => x !== sec))} />
                   {sec}
                 </label>
               ))}
             </div>
             <div className="border-t pt-3 space-y-2">
-              <label className="block text-sm font-medium text-slate-700">كلمة مرور المدير مطلوبة لتأكيد الحذف</label>
+              <label className="block text-sm font-medium text-slate-700">رقم دخول المدير مطلوب لتأكيد الحذف</label>
               <input
                 type="password"
+                inputMode="numeric"
+                maxLength={4}
                 value={clearPassword}
                 onChange={e => { setClearPassword(e.target.value); setClearError('') }}
                 autoComplete="current-password"
-                placeholder="أدخل كلمة المرور"
+                placeholder="أدخل رقم دخول المدير"
                 disabled={clearing}
                 className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-red-500"
               />
               {clearError && <p role="alert" className="text-sm text-red-600">{clearError}</p>}
             </div>
             <button
-              disabled={clearing || clearSections.length === 0 || !clearPassword.trim()}
+              disabled={clearing || clearSections.length === 0 || !/^\\d{4}$/.test(clearPassword) || !user}
               onClick={async () => {
                 if (clearSections.length === 0) {
                   setClearError('اختر قسمًا واحدًا على الأقل')
                   return
                 }
-                if (!clearPassword.trim()) {
-                  setClearError('أدخل كلمة مرور المدير')
+                if (!/^\\d{4}$/.test(clearPassword)) {
+                  setClearError('أدخل رقم دخول المدير المكوّن من 4 أرقام')
                   return
                 }
-                if (!confirm('تحذير: سيتم حذف البيانات المحددة نهائيًا ولا يمكن التراجع. هل تريد المتابعة؟')) return
+                const productWarning = clearSections.includes('products') || clearSections.includes('all')
+                const warning = productWarning
+                  ? 'تحذير: مسح المنتجات سيحذف أيضًا فواتير البيع والشراء والتحويلات والجرد وحركات المخزون المرتبطة بها للحفاظ على سلامة قاعدة البيانات. لا يمكن التراجع. هل تريد المتابعة؟'
+                  : 'تحذير: سيتم حذف البيانات المحددة نهائيًا ولا يمكن التراجع. هل تريد المتابعة؟'
+                if (!confirm(warning)) return
                 setClearing(true)
                 setClearError('')
                 try {
-                  const sections = clearSections.length === 12 ? undefined : clearSections
-                  const result = await window.api.system.clearAllData(sections, clearPassword)
+                  const sections = clearSections.includes('all') ? ['all'] : clearSections
+                  if (!user) throw new Error('انتهت جلسة الدخول، سجل الدخول مرة أخرى')
+                  const result = await window.api.system.clearAllData(sections, user.id, clearPassword)
                   if (result?.ok !== true) throw new Error('لم يؤكد النظام إتمام عملية الحذف')
                   alert('تم مسح البيانات بنجاح')
                   setShowClearModal(false)
