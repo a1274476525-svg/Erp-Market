@@ -352,6 +352,11 @@ function setupIpcHandlers() {
         })
       }
       await tx.product.update({ where: { id: product.id }, data: { currentStock: initialStock } })
+      if (initialStock > 0) {
+        await tx.stockMovement.create({
+          data: { productId: product.id, quantity: initialStock, type: 'adjust', note: 'رصيد افتتاحي' },
+        })
+      }
       return { ...product, currentStock: initialStock }
     })
   )
@@ -903,6 +908,16 @@ function setupIpcHandlers() {
     prisma.$transaction(async (tx) => {
       const branch = await tx.branch.findUnique({ where: { id } })
       if (!branch) throw new Error('الفرع غير موجود')
+      const [movements, transfers, orders, invoices, openCounts] = await Promise.all([
+        tx.stockMovement.count(),
+        tx.transfer.count(),
+        tx.posOrder.count(),
+        tx.purchaseInvoice.count({ where: { status: 'confirmed' } }),
+        tx.inventoryCount.count({ where: { status: { not: 'closed' } } }),
+      ])
+      if (movements + transfers + orders + invoices + openCounts > 0) {
+        throw new Error('لا يمكن تغيير الفرع الرئيسي بعد بدء حركة المخزون أو تسجيل عمليات. انقل الأرصدة وسوِّ العمليات المفتوحة أولاً')
+      }
       await tx.branch.updateMany({ data: { isDefault: false } })
       return tx.branch.update({ where: { id }, data: { isDefault: true } })
     })
@@ -998,6 +1013,16 @@ function setupIpcHandlers() {
     prisma.$transaction(async (tx) => {
       const warehouse = await tx.warehouse.findUnique({ where: { id } })
       if (!warehouse) throw new Error('المخزن غير موجود')
+      const [movements, transfers, orders, invoices, openCounts] = await Promise.all([
+        tx.stockMovement.count(),
+        tx.transfer.count(),
+        tx.posOrder.count(),
+        tx.purchaseInvoice.count({ where: { status: 'confirmed' } }),
+        tx.inventoryCount.count({ where: { status: { not: 'closed' } } }),
+      ])
+      if (movements + transfers + orders + invoices + openCounts > 0) {
+        throw new Error('لا يمكن تغيير المخزن الافتراضي بعد بدء حركة المخزون أو تسجيل عمليات')
+      }
       await tx.warehouse.updateMany({
         where: { branchId: warehouse.branchId },
         data: { isDefault: false },
