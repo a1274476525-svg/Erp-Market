@@ -136,6 +136,7 @@ contextBridge.exposeInMainWorld('api', {
   auth: {
     listUsers: ()                                => ipcRenderer.invoke('auth:listUsers'),
     login:     (userId: number, pin: string)     => ipcRenderer.invoke('auth:login', userId, pin),
+    logout:    ()                                => ipcRenderer.invoke('auth:logout'),
     getAll:    ()                                => ipcRenderer.invoke('auth:getAll'),
     create:    (data: any)                       => ipcRenderer.invoke('auth:create', data),
     update:    (data: any)                       => ipcRenderer.invoke('auth:update', data),
