@@ -881,7 +881,7 @@ function setupIpcHandlers() {
   })
 
   ipcMain.handle('warehouses:syncStock', async (_, warehouseId: number) => {
-    const warehouse = await prisma.warehouse.findUnique({ where: { id: warehouseId } })
+    const warehouse = await prisma.warehouse.findUnique({ where: { id: warehouseId }, include: { branch: true } })
     if (!warehouse) throw new Error('المخزن غير موجود')
     const products = await prisma.product.findMany()
     for (const p of products) {
@@ -889,7 +889,7 @@ function setupIpcHandlers() {
         where: { warehouseId_productId: { warehouseId, productId: p.id } },
         update: {},
         // Seed the default warehouse from the legacy/global product stock on first sync.
-        create: { warehouseId, productId: p.id, quantity: warehouse.isDefault ? p.currentStock : 0 },
+        create: { warehouseId, productId: p.id, quantity: warehouse.isDefault && warehouse.branch.isDefault ? p.currentStock : 0 },
       })
     }
   })
