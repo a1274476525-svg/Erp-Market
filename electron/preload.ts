@@ -84,6 +84,7 @@ contextBridge.exposeInMainWorld('api', {
     create:  (data: any)  => ipcRenderer.invoke('branches:create', data),
     update:  (data: any)  => ipcRenderer.invoke('branches:update', data),
     delete:  (id: number) => ipcRenderer.invoke('branches:delete', id),
+    setDefault: (id: number) => ipcRenderer.invoke('branches:setDefault', id),
   },
   warehouses: {
     init:       ()           => ipcRenderer.invoke('warehouses:init'),
