@@ -1,0 +1,508 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Branch {
+  id         Int         @id @default(autoincrement())
+  name       String
+  isDefault  Boolean     @default(false)
+  createdAt  DateTime    @default(now())
+  warehouses Warehouse[]
+}
+
+model Warehouse {
+  id            Int              @id @default(autoincrement())
+  name          String
+  branch        Branch           @relation(fields: [branchId], references: [id])
+  branchId      Int
+  isDefault     Boolean          @default(false)
+  createdAt     DateTime         @default(now())
+  stocks        WarehouseStock[]
+  requestsFrom  TransferRequest[] @relation("RequestFrom")
+  requestsTo    TransferRequest[] @relation("RequestTo")
+  transfersFrom Transfer[]       @relation("TransferFrom")
+  transfersTo   Transfer[]       @relation("TransferTo")
+}
+
+model WarehouseStock {
+  id          Int       @id @default(autoincrement())
+  warehouse   Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+  warehouseId Int
+  product     Product   @relation(fields: [productId], references: [id])
+  productId   Int
+  quantity    Float     @default(0)
+
+  @@unique([warehouseId, productId])
+}
+
+model Category {
+  id          Int       @id @default(autoincrement())
+  name        String    @unique
+  description String?
+  createdAt   DateTime  @default(now())
+  products    Product[]
+}
+
+model Product {
+  id               Int               @id @default(autoincrement())
+  name             String
+  barcode          String?           @unique
+  sku              String?           @unique
+  categoryId       Int?
+  category         Category?         @relation(fields: [categoryId], references: [id])
+  unit             String            @default("قطعة")
+  costPrice        Float             @default(0)
+  sellingPrice     Float             @default(0)
+  wholesalePrice   Float?
+  minStockAlert    Float             @default(0)
+  reorderLevel     Float             @default(0)
+  currentStock     Float             @default(0)
+  conversionFactor Float             @default(1)
+  isActive         Boolean           @default(true)
+  imagePath        String?
+  createdAt        DateTime          @default(now())
+
+  purchaseItems         PurchaseItem[]
+  purchaseRequestItems  PurchaseRequestItem[]
+  saleItems             PosOrderItem[]
+  returnItems           SaleReturnItem[]
+  stockMovements        StockMovement[]
+  promotions            PromotionProduct[]
+  warehouseStocks       WarehouseStock[]
+  transferItems         TransferItem[]
+  transferRequestItems  TransferRequestItem[]
+  inventoryItems        InventoryCountItem[]
+  priceHistory          PriceHistory[]
+  barcodes              ProductBarcode[]
+  units                 ProductUnit[]
+}
+
+model ProductBarcode {
+  id               Int      @id @default(autoincrement())
+  product          Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  productId        Int
+  barcode          String   @unique
+  unit             String
+  conversionFactor Float    @default(1)
+  sellPrice        Float?
+  costPrice        Float?
+  isBase           Boolean  @default(false)
+  createdAt        DateTime @default(now())
+}
+
+model ProductUnit {
+  id               Int      @id @default(autoincrement())
+  product          Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  productId        Int
+  unitName         String
+  level            Int      @default(1)
+  conversionToBase Float    @default(1)
+  sellPrice        Float    @default(0)
+  costPrice        Float    @default(0)
+  isBase           Boolean  @default(false)
+  createdAt        DateTime @default(now())
+
+  @@unique([productId, unitName])
+}
+
+model PriceHistory {
+  id        Int      @id @default(autoincrement())
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  productId Int
+  costPrice Float
+  date      DateTime @default(now())
+  note      String?
+}
+
+model Customer {
+  id            Int        @id @default(autoincrement())
+  name          String
+  phone         String?    @unique
+  address       String?
+  loyaltyPoints Int        @default(0)
+  createdAt     DateTime   @default(now())
+  orders        PosOrder[]
+}
+
+model Supplier {
+  id               Int               @id @default(autoincrement())
+  name             String
+  phone            String?
+  address          String?
+  taxNumber        String?
+  createdAt        DateTime          @default(now())
+  invoices         PurchaseInvoice[]
+  purchaseRequests PurchaseRequest[]
+}
+
+model PurchaseInvoice {
+  id            Int            @id @default(autoincrement())
+  supplier      Supplier?      @relation(fields: [supplierId], references: [id])
+  supplierId    Int?
+  invoiceNumber String?
+  invoiceDate   DateTime
+  subtotal      Float
+  taxRate       Float          @default(14)
+  taxAmount     Float          @default(0)
+  total         Float
+  notes         String?
+  status        String         @default("confirmed")
+  createdAt     DateTime       @default(now())
+  items         PurchaseItem[]
+}
+
+model PurchaseItem {
+  id        Int             @id @default(autoincrement())
+  invoice   PurchaseInvoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  invoiceId Int
+  product   Product         @relation(fields: [productId], references: [id])
+  productId Int
+  quantity  Float
+  unitPrice Float
+  totalPrice Float
+}
+
+model PurchaseRequest {
+  id          Int                   @id @default(autoincrement())
+  supplier    Supplier?             @relation(fields: [supplierId], references: [id])
+  supplierId  Int?
+  status      String                @default("pending")
+  notes       String?
+  requestDate DateTime              @default(now())
+  createdAt   DateTime              @default(now())
+  items       PurchaseRequestItem[]
+}
+
+model PurchaseRequestItem {
+  id        Int             @id @default(autoincrement())
+  request   PurchaseRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  requestId Int
+  product   Product         @relation(fields: [productId], references: [id])
+  productId Int
+  quantity  Float
+  notes     String?
+}
+
+model Promotion {
+  id            Int                @id @default(autoincrement())
+  name          String
+  discountType  String             @default("percentage")
+  discountValue Float
+  startDate     DateTime
+  endDate       DateTime
+  isActive      Boolean            @default(true)
+  applyToAll    Boolean            @default(false)
+  minQuantity   Float              @default(0)
+  createdAt     DateTime           @default(now())
+  products      PromotionProduct[]
+}
+
+model PromotionProduct {
+  id          Int       @id @default(autoincrement())
+  promotion   Promotion @relation(fields: [promotionId], references: [id], onDelete: Cascade)
+  promotionId Int
+  product     Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  productId   Int
+
+  @@unique([promotionId, productId])
+}
+
+model PosOrder {
+  id             Int            @id @default(autoincrement())
+  orderNumber    String         @unique
+  customer       Customer?      @relation(fields: [customerId], references: [id])
+  customerId     Int?
+  cashierId      Int?
+  paymentMethod  String         @default("cash")
+  subtotal       Float
+  discountType   String?
+  discountValue  Float          @default(0)
+  discountAmount Float          @default(0)
+  taxRate        Float          @default(0)
+  taxAmount      Float          @default(0)
+  total          Float
+  note           String?
+  status         String         @default("completed")
+  createdAt      DateTime       @default(now())
+  items          PosOrderItem[]
+  returns        SaleReturn[]
+}
+
+model PosOrderItem {
+  id          Int      @id @default(autoincrement())
+  order       PosOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderId     Int
+  product     Product  @relation(fields: [productId], references: [id])
+  productId   Int
+  productName String
+  quantity    Float
+  unitPrice   Float
+  total       Float
+}
+
+model SaleReturn {
+  id         Int              @id @default(autoincrement())
+  order      PosOrder         @relation(fields: [orderId], references: [id])
+  orderId    Int
+  returnDate DateTime         @default(now())
+  reason     String?
+  total      Float
+  items      SaleReturnItem[]
+}
+
+model SaleReturnItem {
+  id          Int        @id @default(autoincrement())
+  saleReturn  SaleReturn @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  returnId    Int
+  product     Product    @relation(fields: [productId], references: [id])
+  productId   Int
+  productName String
+  quantity    Float
+  unitPrice   Float
+  total       Float
+}
+
+model StockMovement {
+  id          Int      @id @default(autoincrement())
+  product     Product  @relation(fields: [productId], references: [id])
+  productId   Int
+  quantity    Float
+  type        String
+  referenceId Int?
+  note        String?
+  createdAt   DateTime @default(now())
+}
+
+model TransferRequest {
+  id              Int                   @id @default(autoincrement())
+  referenceNumber String                @unique
+  fromWarehouse   Warehouse             @relation("RequestFrom", fields: [fromWarehouseId], references: [id])
+  fromWarehouseId Int
+  toWarehouse     Warehouse             @relation("RequestTo", fields: [toWarehouseId], references: [id])
+  toWarehouseId   Int
+  status          String                @default("pending")
+  note            String?
+  requestDate     DateTime              @default(now())
+  createdAt       DateTime              @default(now())
+  items           TransferRequestItem[]
+  transfer        Transfer?
+}
+
+model TransferRequestItem {
+  id        Int             @id @default(autoincrement())
+  request   TransferRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  requestId Int
+  product   Product         @relation(fields: [productId], references: [id])
+  productId Int
+  quantity  Float
+  notes     String?
+}
+
+model Transfer {
+  id              Int              @id @default(autoincrement())
+  referenceNumber String           @unique
+  request         TransferRequest? @relation(fields: [requestId], references: [id])
+  requestId       Int?             @unique
+  fromWarehouse   Warehouse        @relation("TransferFrom", fields: [fromWarehouseId], references: [id])
+  fromWarehouseId Int
+  toWarehouse     Warehouse        @relation("TransferTo", fields: [toWarehouseId], references: [id])
+  toWarehouseId   Int
+  transferDate    DateTime         @default(now())
+  note            String?
+  createdAt       DateTime         @default(now())
+  items           TransferItem[]
+}
+
+model TransferItem {
+  id          Int      @id @default(autoincrement())
+  transfer    Transfer @relation(fields: [transferId], references: [id], onDelete: Cascade)
+  transferId  Int
+  product     Product  @relation(fields: [productId], references: [id])
+  productId   Int
+  quantity    Float
+}
+
+model InventoryCount {
+  id              Int                  @id @default(autoincrement())
+  referenceNumber String               @unique
+  status          String               @default("draft")
+  workDate        DateTime?
+  note            String?
+  createdAt       DateTime             @default(now())
+  closedAt        DateTime?
+  items           InventoryCountItem[]
+}
+
+model InventoryCountItem {
+  id               Int            @id @default(autoincrement())
+  inventoryCount   InventoryCount @relation(fields: [inventoryCountId], references: [id], onDelete: Cascade)
+  inventoryCountId Int
+  product          Product        @relation(fields: [productId], references: [id])
+  productId        Int
+  systemQuantity   Float
+  actualQuantity   Float          @default(0)
+
+  @@unique([inventoryCountId, productId])
+}
+
+model Role {
+  id          Int     @id @default(autoincrement())
+  name        String  @unique
+  fullAccess  Boolean @default(false)
+  permissions String  @default("[]")
+  isSystem    Boolean @default(false)
+}
+
+model User {
+  id        Int           @id @default(autoincrement())
+  name      String
+  pin       String
+  role      String        @default("")
+  isActive  Boolean       @default(true)
+  createdAt DateTime      @default(now())
+  logs      ActivityLog[]
+}
+
+model ActivityLog {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id])
+  action    String
+  entity    String?
+  entityId  Int?
+  details   String?
+  createdAt DateTime @default(now())
+}
+
+model Setting {
+  key   String @id
+  value String
+}
+
+model ExpenseCategory {
+  id          Int       @id @default(autoincrement())
+  name        String    @unique
+  description String?
+  createdAt   DateTime  @default(now())
+  expenses    Expense[]
+}
+
+model Expense {
+  id          Int             @id @default(autoincrement())
+  category    ExpenseCategory @relation(fields: [categoryId], references: [id])
+  categoryId  Int
+  amount      Float
+  description String?
+  date        DateTime        @default(now())
+  paymentMethod String        @default("cash")
+  createdAt   DateTime        @default(now())
+}
+
+// ─── CHART OF ACCOUNTS ─────────────────────────────────────────
+model Account {
+  id            Int                @id @default(autoincrement())
+  code          String             @unique
+  name          String
+  type          String             // asset | liability | equity | revenue | expense
+  normalBalance String             @default("debit") // debit | credit
+  parentId      Int?
+  parent        Account?           @relation("AccountTree", fields: [parentId], references: [id])
+  children      Account[]          @relation("AccountTree")
+  level         Int                @default(1)
+  isActive      Boolean            @default(true)
+  description   String?
+  createdAt     DateTime           @default(now())
+  journalLines  JournalEntryLine[]
+  bankAccounts  BankAccount[]      @relation("BankToChartAccount")
+}
+
+// ─── BANKS & CASH ──────────────────────────────────────────────
+model BankAccount {
+  id             Int               @id @default(autoincrement())
+  name           String
+  type           String            @default("bank") // bank | cash | custody
+  bankName       String?
+  accountNumber  String?
+  currentBalance Float             @default(0)
+  currency       String            @default("EGP")
+  isActive       Boolean           @default(true)
+  notes          String?
+  accountId      Int?
+  account        Account?          @relation("BankToChartAccount", fields: [accountId], references: [id])
+  createdAt      DateTime          @default(now())
+  transactions   BankTransaction[]
+  statementLines BankStatementLine[]
+}
+
+model BankTransaction {
+  id              Int         @id @default(autoincrement())
+  bankAccount     BankAccount @relation(fields: [bankAccountId], references: [id], onDelete: Cascade)
+  bankAccountId   Int
+  type            String      // deposit | withdrawal | transfer
+  amount          Float
+  balanceAfter    Float       @default(0)
+  description     String?
+  referenceNumber String?
+  contraAccountId Int?
+  journalEntryId  Int?
+  date            DateTime    @default(now())
+  createdAt       DateTime    @default(now())
+}
+
+// ─── BANK STATEMENT IMPORT & RECONCILIATION ───────────────────
+model BankStatementLine {
+  id                   Int         @id @default(autoincrement())
+  bankAccount          BankAccount @relation(fields: [bankAccountId], references: [id], onDelete: Cascade)
+  bankAccountId        Int
+  date                 DateTime
+  description          String?
+  reference            String?
+  amount               Float       // موجب = إيداع/دائن، سالب = سحب/مدين
+  balance              Float?
+  status               String      @default("unmatched") // unmatched | matched | ignored
+  matchedTransactionId Int?
+  importBatch          String?
+  createdAt            DateTime    @default(now())
+}
+
+model BankRule {
+  id              Int      @id @default(autoincrement())
+  name            String
+  type            String   // expense | receipt | transfer (تصنيف عرضي فقط)
+  matchType       String   @default("contains") // contains | startsWith | equals
+  matchValue      String
+  contraAccountId Int?
+  bankAccountId   Int?     // null = تنطبق على كل الحسابات
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+}
+
+// ─── JOURNAL ENTRIES ──────────────────────────────────────────
+model JournalEntry {
+  id          Int                @id @default(autoincrement())
+  number      String             @unique
+  date        DateTime
+  description String?
+  reference   String?
+  status      String             @default("draft") // draft | posted
+  source      String             @default("manual") // manual | bank | sale | purchase | expense
+  sourceId    Int?
+  createdAt   DateTime           @default(now())
+  lines       JournalEntryLine[]
+}
+
+model JournalEntryLine {
+  id          Int          @id @default(autoincrement())
+  entry       JournalEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+  entryId     Int
+  account     Account      @relation(fields: [accountId], references: [id])
+  accountId   Int
+  debit       Float        @default(0)
+  credit      Float        @default(0)
+  description String?
+}
