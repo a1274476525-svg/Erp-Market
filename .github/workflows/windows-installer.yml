@@ -13,7 +13,7 @@ jobs:
   windows-installer:
     runs-on: windows-latest
     env:
-      DATABASE_URL: file:./prisma/umarket.db
+      DATABASE_URL: file:./umarket.db
     steps:
       - name: Checkout
         uses: actions/checkout@v4
