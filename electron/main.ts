@@ -11515,7 +11515,6 @@ function setupIpcHandlers() {
     const actual = scryptSync(pin, salt, expected.length)
     return actual.length === expected.length && timingSafeEqual(actual, expected)
   }
-  // Upgrade legacy plaintext PINs after the first successful verification.
   return pin === stored
 }
 
@@ -24371,7 +24370,6 @@ function setupIpcHandlers() {
     const actual = scryptSync(pin, salt, expected.length)
     return actual.length === expected.length && timingSafeEqual(actual, expected)
   }
-  // Upgrade legacy plaintext PINs after the first successful verification.
   return pin === stored
 }
 
@@ -35993,7 +35991,6 @@ function setupIpcHandlers() {
     const actual = scryptSync(pin, salt, expected.length)
     return actual.length === expected.length && timingSafeEqual(actual, expected)
   }
-  // Upgrade legacy plaintext PINs after the first successful verification.
   return pin === stored
 }
 
@@ -48849,7 +48846,6 @@ function setupIpcHandlers() {
     const actual = scryptSync(pin, salt, expected.length)
     return actual.length === expected.length && timingSafeEqual(actual, expected)
   }
-  // Upgrade legacy plaintext PINs after the first successful verification.
   return pin === stored
 }
 
