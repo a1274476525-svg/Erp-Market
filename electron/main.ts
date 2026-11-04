@@ -6,7 +6,7 @@ import { Prisma, PrismaClient } from '@prisma/client'
 const __filename = fileURLToPath(import.meta.url)
 const __dirname  = path.dirname(__filename)
 
-const isDev = process.env.NODE_ENV !== 'production'
+const isDev = !app.isPackaged
 
 const dbPath = isDev
   ? path.join(process.cwd(), 'prisma', 'umarket.db')
@@ -61,6 +61,11 @@ function createWindow() {
     mainWindow.loadFile(path.join(__dirname, '../dist/index.html'))
   }
 
+  const windowId = mainWindow.webContents.id
+  mainWindow.webContents.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace) authenticatedSessions.delete(windowId)
+  })
+  mainWindow.webContents.on('destroyed', () => authenticatedSessions.delete(windowId))
   mainWindow.once('ready-to-show', () => mainWindow?.show())
 }
 
