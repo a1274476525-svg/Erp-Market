@@ -72,6 +72,7 @@ interface Window {
       create: (data: any) => Promise<any>
       update: (data: any) => Promise<any>
       delete: (id: number) => Promise<any>
+      setDefault: (id: number) => Promise<any>
     }
     warehouses: {
       init: () => Promise<void>
