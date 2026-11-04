@@ -19,6 +19,8 @@ console.log('[DB]', dbUrl)
 const prisma = new PrismaClient()
 
 let mainWindow: BrowserWindow | null = null
+const clearPinFailures = new Map<number, { count: number; lockedUntil: number }>()
+const loginPinFailures = new Map<number, { count: number; lockedUntil: number }>()
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -462,17 +464,19 @@ function setupIpcHandlers() {
   )
 
   ipcMain.handle('invoices:confirmDraft', async (_, id: number) => {
-    const current = await prisma.purchaseInvoice.findUnique({ where: { id } })
-    if (!current) throw new Error('الفاتورة غير موجودة')
-    if (current.status !== 'draft') throw new Error('الفاتورة ليست في حالة مسودة')
-
     const invoice = await prisma.$transaction(async (tx) => {
-      const inv = await tx.purchaseInvoice.update({
-        where: { id },
+      const claimed = await tx.purchaseInvoice.updateMany({
+        where: { id, status: 'draft' },
         data: { status: 'confirmed' },
+      })
+      if (claimed.count !== 1) throw new Error('الفاتورة غير موجودة أو تم تأكيدها مسبقًا')
+      const inv = await tx.purchaseInvoice.findUnique({
+        where: { id },
         include: { items: true },
       })
+      if (!inv) throw new Error('الفاتورة غير موجودة')
       for (const item of inv.items) {
+        if (!Number.isFinite(item.quantity) || item.quantity <= 0) throw new Error('كمية شراء غير صالحة')
         await tx.product.update({
           where: { id: item.productId },
           data: { currentStock: { increment: item.quantity }, costPrice: item.unitPrice },
@@ -558,9 +562,15 @@ function setupIpcHandlers() {
 
   // ─── POS ───────────────────────────────────────────────────────
   ipcMain.handle('pos:createOrder', async (_, { items, customerId, ...header }) => {
+    if (!Array.isArray(items) || items.length === 0) throw new Error('أضف صنفًا واحدًا على الأقل')
+    for (const item of items) {
+      if (!Number.isInteger(item.productId) || !Number.isFinite(item.quantity) || item.quantity <= 0) {
+        throw new Error('بيانات صنف غير صالحة')
+      }
+    }
     const order = await prisma.$transaction(async (tx) => {
-      const count = await tx.posOrder.count()
-      const num   = String(count + 1).padStart(6, '0')
+      const maxOrder = await tx.posOrder.aggregate({ _max: { id: true } })
+      const num = String((maxOrder._max.id ?? 0) + 1).padStart(6, '0')
       const o = await tx.posOrder.create({
         data: {
           orderNumber: `ORD-${num}`,
@@ -571,10 +581,11 @@ function setupIpcHandlers() {
         include: { items: true },
       })
       for (const item of o.items) {
-        await tx.product.update({
-          where: { id: item.productId },
+        const updated = await tx.product.updateMany({
+          where: { id: item.productId, isActive: true, currentStock: { gte: item.quantity } },
           data: { currentStock: { decrement: item.quantity } },
         })
+        if (updated.count !== 1) throw new Error('المخزون غير كافٍ أو المنتج غير نشط')
         await tx.stockMovement.create({
           data: { productId: item.productId, quantity: -item.quantity, type: 'sale', referenceId: o.id },
         })
@@ -605,6 +616,14 @@ function setupIpcHandlers() {
 
   ipcMain.handle('pos:voidOrder', async (_, id: number) => {
     const order = await prisma.$transaction(async (tx) => {
+      const current = await tx.posOrder.findUnique({
+        where: { id },
+        include: { items: true, returns: true },
+      })
+      if (!current) throw new Error('الفاتورة غير موجودة')
+      if (current.status !== 'completed') throw new Error('الفاتورة ملغاة بالفعل')
+      if (current.returns.length > 0) throw new Error('لا يمكن إلغاء فاتورة لها مرتجعات مسجلة')
+
       const o = await tx.posOrder.update({
         where: { id },
         data: { status: 'voided' },
@@ -638,9 +657,9 @@ function setupIpcHandlers() {
             sourceId: id,
             lines: {
               create: je.lines.map(l => ({
-                accountId:   l.accountId,
-                debit:       l.credit,
-                credit:      l.debit,
+                accountId: l.accountId,
+                debit: l.credit,
+                credit: l.debit,
                 description: l.description,
               })),
             },
@@ -655,10 +674,43 @@ function setupIpcHandlers() {
   })
 
   ipcMain.handle('pos:createReturn', async (_, { orderId, items, reason }) => {
-    const total = items.reduce((s: number, i: any) => s + i.total, 0)
-    const ret   = await prisma.$transaction(async (tx) => {
+    if (!Array.isArray(items) || items.length === 0) throw new Error('حدد أصناف المرتجع')
+    const ret = await prisma.$transaction(async (tx) => {
+      const order = await tx.posOrder.findUnique({
+        where: { id: orderId },
+        include: { items: true, returns: { include: { items: true } } },
+      })
+      if (!order || order.status !== 'completed') throw new Error('الفاتورة غير موجودة أو ملغاة')
+
+      const requestedByProduct = new Map<number, number>()
+      for (const item of items) {
+        if (!Number.isInteger(item.productId) || !Number.isFinite(item.quantity) || item.quantity <= 0) {
+          throw new Error('كمية المرتجع غير صالحة')
+        }
+        requestedByProduct.set(item.productId, (requestedByProduct.get(item.productId) ?? 0) + item.quantity)
+      }
+
+      const normalizedItems = [...requestedByProduct.entries()].map(([productId, quantity]) => {
+        const soldItems = order.items.filter(i => i.productId === productId)
+        if (soldItems.length === 0) throw new Error('الصنف غير موجود في الفاتورة الأصلية')
+        const soldQuantity = soldItems.reduce((sum, item) => sum + item.quantity, 0)
+        const alreadyReturned = order.returns.reduce((sum, ret) =>
+          sum + ret.items.filter(item => item.productId === productId).reduce((part, item) => part + item.quantity, 0), 0)
+        if (quantity > soldQuantity - alreadyReturned) {
+          throw new Error(`كمية المرتجع تتجاوز الكمية المباعة للصنف ${soldItems[0].productName}`)
+        }
+        const unitPrice = soldItems[0].unitPrice
+        return {
+          productId,
+          productName: soldItems[0].productName,
+          quantity,
+          unitPrice,
+          total: quantity * unitPrice,
+        }
+      })
+      const total = normalizedItems.reduce((sum, item) => sum + item.total, 0)
       const r = await tx.saleReturn.create({
-        data: { orderId, reason, total, items: { create: items } },
+        data: { orderId, reason, total, items: { create: normalizedItems } },
         include: { items: true },
       })
       for (const item of r.items) {
@@ -676,7 +728,7 @@ function setupIpcHandlers() {
     try {
       const [salesAcc, cashAcc, cogsAcc, invAcc] = await Promise.all([
         findAccByCode('4111'), findAccByCode('1111'),
-        findAccByCode('521'),  findAccByCode('1131'),
+        findAccByCode('521'), findAccByCode('1131'),
       ])
       if (salesAcc && cashAcc) {
         await autoJE({
@@ -686,20 +738,19 @@ function setupIpcHandlers() {
           source: 'sale',
           sourceId: ret.id,
           lines: [
-            { accountId: salesAcc.id, debit: total, credit: 0,     description: 'مرتجع مبيعات' },
-            { accountId: cashAcc.id,  debit: 0,     credit: total, description: 'استرداد نقدي' },
+            { accountId: salesAcc.id, debit: ret.total, credit: 0, description: 'مرتجع مبيعات' },
+            { accountId: cashAcc.id, debit: 0, credit: ret.total, description: 'استرداد نقدي' },
           ],
         })
       }
       if (cogsAcc && invAcc) {
         const productIds = [...new Set(ret.items.map(i => i.productId))]
-        const products   = await prisma.product.findMany({
+        const products = await prisma.product.findMany({
           where: { id: { in: productIds } },
           select: { id: true, costPrice: true },
         })
         const costMap = new Map(products.map(p => [p.id, p.costPrice]))
-        let cost = 0
-        for (const item of ret.items) cost += item.quantity * (costMap.get(item.productId) ?? 0)
+        const cost = ret.items.reduce((sum, item) => sum + item.quantity * (costMap.get(item.productId) ?? 0), 0)
         if (cost > 0) {
           await autoJE({
             date: new Date(ret.returnDate),
@@ -708,8 +759,8 @@ function setupIpcHandlers() {
             source: 'sale',
             sourceId: ret.id,
             lines: [
-              { accountId: invAcc.id,  debit: cost, credit: 0,    description: 'إعادة مخزون' },
-              { accountId: cogsAcc.id, debit: 0,    credit: cost, description: 'عكس تكلفة' },
+              { accountId: invAcc.id, debit: cost, credit: 0, description: 'إعادة مخزون' },
+              { accountId: cogsAcc.id, debit: 0, credit: cost, description: 'عكس تكلفة' },
             ],
           })
         }
@@ -830,12 +881,15 @@ function setupIpcHandlers() {
   })
 
   ipcMain.handle('warehouses:syncStock', async (_, warehouseId: number) => {
+    const warehouse = await prisma.warehouse.findUnique({ where: { id: warehouseId }, include: { branch: true } })
+    if (!warehouse) throw new Error('المخزن غير موجود')
     const products = await prisma.product.findMany()
     for (const p of products) {
       await prisma.warehouseStock.upsert({
         where: { warehouseId_productId: { warehouseId, productId: p.id } },
         update: {},
-        create: { warehouseId, productId: p.id, quantity: 0 },
+        // Seed the default warehouse from the legacy/global product stock on first sync.
+        create: { warehouseId, productId: p.id, quantity: warehouse.isDefault && warehouse.branch.isDefault ? p.currentStock : 0 },
       })
     }
   })
@@ -882,67 +936,101 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('transfers:execute', async (_, requestId: number) => {
-    const req = await prisma.transferRequest.findUnique({
-      where: { id: requestId },
-      include: { items: true },
+  ipcMain.handle('transfers:execute', async (_, requestId: number) =>
+    prisma.$transaction(async (tx) => {
+      const req = await tx.transferRequest.findUnique({
+        where: { id: requestId },
+        include: { items: true, transfer: true },
+      })
+      if (!req) throw new Error('طلب التحويل غير موجود')
+      if (req.transfer || req.status === 'transferred') throw new Error('تم تنفيذ طلب التحويل بالفعل')
+      if (req.status !== 'approved') throw new Error('يجب الموافقة على طلب التحويل أولاً')
+      if (req.fromWarehouseId === req.toWarehouseId) throw new Error('لا يمكن التحويل إلى نفس المخزن')
+      if (req.items.length === 0) throw new Error('طلب التحويل لا يحتوي على أصناف')
+
+      const maxTransfer = await tx.transfer.aggregate({ _max: { id: true } })
+      const ref = `TRF-${String((maxTransfer._max.id ?? 0) + 1).padStart(5, '0')}`
+      const transfer = await tx.transfer.create({
+        data: {
+          referenceNumber: ref,
+          requestId,
+          fromWarehouseId: req.fromWarehouseId,
+          toWarehouseId: req.toWarehouseId,
+          items: { create: req.items.map(i => ({ productId: i.productId, quantity: i.quantity })) },
+        },
+        include: { items: true },
+      })
+
+      for (const item of transfer.items) {
+        if (!Number.isFinite(item.quantity) || item.quantity <= 0) throw new Error('كمية تحويل غير صالحة')
+        await tx.warehouseStock.upsert({
+          where: { warehouseId_productId: { warehouseId: req.fromWarehouseId, productId: item.productId } },
+          update: { quantity: { decrement: item.quantity } },
+          create: { warehouseId: req.fromWarehouseId, productId: item.productId, quantity: -item.quantity },
+        })
+        await tx.warehouseStock.upsert({
+          where: { warehouseId_productId: { warehouseId: req.toWarehouseId, productId: item.productId } },
+          update: { quantity: { increment: item.quantity } },
+          create: { warehouseId: req.toWarehouseId, productId: item.productId, quantity: item.quantity },
+        })
+      }
+      await tx.transferRequest.update({ where: { id: requestId }, data: { status: 'transferred' } })
+      return transfer
     })
-    if (!req) throw new Error('Request not found')
+  )
 
-    const count = await prisma.transfer.count()
-    const ref   = `TRF-${String(count + 1).padStart(5, '0')}`
-
-    const transfer = await prisma.transfer.create({
-      data: {
-        referenceNumber: ref,
-        requestId,
-        fromWarehouseId: req.fromWarehouseId,
-        toWarehouseId:   req.toWarehouseId,
-        items: { create: req.items.map(i => ({ productId: i.productId, quantity: i.quantity })) },
-      },
-      include: { items: true },
+  ipcMain.handle('transfers:createDirect', async (_, { items, ...data }) =>
+    prisma.$transaction(async (tx) => {
+      if (!Array.isArray(items) || items.length === 0) throw new Error('أضف أصناف التحويل')
+      if (data.fromWarehouseId === data.toWarehouseId) throw new Error('لا يمكن التحويل إلى نفس المخزن')
+      const maxTransfer = await tx.transfer.aggregate({ _max: { id: true } })
+      const ref = `TRF-${String((maxTransfer._max.id ?? 0) + 1).padStart(5, '0')}`
+      const transfer = await tx.transfer.create({
+        data: { ...data, referenceNumber: ref, items: { create: items } },
+        include: { items: true },
+      })
+      for (const item of transfer.items) {
+        if (!Number.isFinite(item.quantity) || item.quantity <= 0) throw new Error('كمية تحويل غير صالحة')
+        await tx.warehouseStock.upsert({
+          where: { warehouseId_productId: { warehouseId: data.fromWarehouseId, productId: item.productId } },
+          update: { quantity: { decrement: item.quantity } },
+          create: { warehouseId: data.fromWarehouseId, productId: item.productId, quantity: -item.quantity },
+        })
+        await tx.warehouseStock.upsert({
+          where: { warehouseId_productId: { warehouseId: data.toWarehouseId, productId: item.productId } },
+          update: { quantity: { increment: item.quantity } },
+          create: { warehouseId: data.toWarehouseId, productId: item.productId, quantity: item.quantity },
+        })
+      }
+      return transfer
     })
+  )
 
-    for (const item of transfer.items) {
-      await prisma.warehouseStock.upsert({
-        where: { warehouseId_productId: { warehouseId: req.fromWarehouseId, productId: item.productId } },
-        update: { quantity: { decrement: item.quantity } },
-        create: { warehouseId: req.fromWarehouseId, productId: item.productId, quantity: -item.quantity },
-      })
-      await prisma.warehouseStock.upsert({
-        where: { warehouseId_productId: { warehouseId: req.toWarehouseId, productId: item.productId } },
-        update: { quantity: { increment: item.quantity } },
-        create: { warehouseId: req.toWarehouseId, productId: item.productId, quantity: item.quantity },
-      })
-    }
-    await prisma.transferRequest.update({ where: { id: requestId }, data: { status: 'transferred' } })
-    return transfer
-  })
-
-  ipcMain.handle('transfers:createDirect', async (_, { items, ...data }) => {
-    const count = await prisma.transfer.count()
-    const ref   = `TRF-${String(count + 1).padStart(5, '0')}`
-    const transfer = await prisma.transfer.create({
-      data: { ...data, referenceNumber: ref, items: { create: items } },
-      include: { items: true },
+  ipcMain.handle('transfers:delete', async (_, id: number) =>
+    prisma.$transaction(async (tx) => {
+      const transfer = await tx.transfer.findUnique({ where: { id }, include: { items: true } })
+      if (!transfer) throw new Error('التحويل غير موجود')
+      for (const item of transfer.items) {
+        await tx.warehouseStock.upsert({
+          where: { warehouseId_productId: { warehouseId: transfer.toWarehouseId, productId: item.productId } },
+          update: { quantity: { decrement: item.quantity } },
+          create: { warehouseId: transfer.toWarehouseId, productId: item.productId, quantity: -item.quantity },
+        })
+        await tx.warehouseStock.upsert({
+          where: { warehouseId_productId: { warehouseId: transfer.fromWarehouseId, productId: item.productId } },
+          update: { quantity: { increment: item.quantity } },
+          create: { warehouseId: transfer.fromWarehouseId, productId: item.productId, quantity: item.quantity },
+        })
+      }
+      const deleted = await tx.transfer.delete({ where: { id } })
+      if (transfer.requestId) {
+        await tx.transferRequest.update({
+          where: { id: transfer.requestId },
+          data: { status: 'approved' },
+        })
+      }
+      return deleted
     })
-    for (const item of transfer.items) {
-      await prisma.warehouseStock.upsert({
-        where: { warehouseId_productId: { warehouseId: data.fromWarehouseId, productId: item.productId } },
-        update: { quantity: { decrement: item.quantity } },
-        create: { warehouseId: data.fromWarehouseId, productId: item.productId, quantity: -item.quantity },
-      })
-      await prisma.warehouseStock.upsert({
-        where: { warehouseId_productId: { warehouseId: data.toWarehouseId, productId: item.productId } },
-        update: { quantity: { increment: item.quantity } },
-        create: { warehouseId: data.toWarehouseId, productId: item.productId, quantity: item.quantity },
-      })
-    }
-    return transfer
-  })
-
-  ipcMain.handle('transfers:delete', (_, id: number) =>
-    prisma.transfer.delete({ where: { id } })
   )
 
   // ─── INVENTORY COUNT ───────────────────────────────────────────
@@ -978,26 +1066,32 @@ function setupIpcHandlers() {
     prisma.inventoryCountItem.update({ where: { id }, data: { actualQuantity } })
   )
 
-  ipcMain.handle('inventory:close', async (_, id: number) => {
-    const count = await prisma.inventoryCount.findUnique({
-      where: { id },
-      include: { items: true },
-    })
-    if (!count) throw new Error('Not found')
-    for (const item of count.items) {
-      const diff = item.actualQuantity - item.systemQuantity
-      await prisma.product.update({ where: { id: item.productId }, data: { currentStock: item.actualQuantity } })
-      if (diff !== 0) {
-        await prisma.stockMovement.create({
-          data: { productId: item.productId, quantity: diff, type: 'adjust', note: `جرد #${count.referenceNumber}` },
+  ipcMain.handle('inventory:close', async (_, id: number) =>
+    prisma.$transaction(async (tx) => {
+      const count = await tx.inventoryCount.findUnique({
+        where: { id },
+        include: { items: true },
+      })
+      if (!count) throw new Error('الجرد غير موجود')
+      if (count.status === 'closed') throw new Error('تم إغلاق هذا الجرد بالفعل')
+      for (const item of count.items) {
+        const diff = item.actualQuantity - item.systemQuantity
+        await tx.product.update({
+          where: { id: item.productId },
+          data: { currentStock: item.actualQuantity },
         })
+        if (diff !== 0) {
+          await tx.stockMovement.create({
+            data: { productId: item.productId, quantity: diff, type: 'adjust', note: `جرد #${count.referenceNumber}` },
+          })
+        }
       }
-    }
-    return prisma.inventoryCount.update({
-      where: { id },
-      data: { status: 'closed', closedAt: new Date() },
+      return tx.inventoryCount.update({
+        where: { id },
+        data: { status: 'closed', closedAt: new Date() },
+      })
     })
-  })
+  )
 
   ipcMain.handle('inventory:delete', (_, id: number) =>
     prisma.inventoryCount.delete({ where: { id } })
@@ -1132,22 +1226,49 @@ function setupIpcHandlers() {
   )
 
   ipcMain.handle('auth:login', async (_, userId: number, pin: string) => {
-    const user = await prisma.user.findFirst({ where: { id: userId, pin, isActive: true } })
-    if (!user) return null
+    if (!Number.isInteger(userId) || typeof pin !== 'string') return null
+    const now = Date.now()
+    const failure = loginPinFailures.get(userId)
+    if (failure && failure.lockedUntil > now) return null
+    const user = await prisma.user.findFirst({
+      where: { id: userId, pin, isActive: true },
+      select: { id: true, name: true, role: true, isActive: true, createdAt: true },
+    })
+    if (!user) {
+      const count = (failure?.count ?? 0) + 1
+      loginPinFailures.set(userId, {
+        count: count >= 5 ? 0 : count,
+        lockedUntil: count >= 5 ? now + 60_000 : 0,
+      })
+      return null
+    }
+    loginPinFailures.delete(userId)
     const roleData = await resolveRole(user.role)
+    if (!roleData) return null
     return { ...user, roleData }
   })
 
+  // Never send stored PINs to the renderer.
   ipcMain.handle('auth:getAll', () =>
-    prisma.user.findMany({ orderBy: { name: 'asc' } })
+    prisma.user.findMany({
+      select: { id: true, name: true, role: true, isActive: true, createdAt: true },
+      orderBy: { name: 'asc' },
+    })
   )
 
   ipcMain.handle('auth:create', (_, data) =>
-    prisma.user.create({ data })
+    prisma.user.create({
+      data,
+      select: { id: true, name: true, role: true, isActive: true, createdAt: true },
+    })
   )
 
   ipcMain.handle('auth:update', (_, { id, ...data }) =>
-    prisma.user.update({ where: { id }, data })
+    prisma.user.update({
+      where: { id },
+      data,
+      select: { id: true, name: true, role: true, isActive: true, createdAt: true },
+    })
   )
 
   ipcMain.handle('auth:delete', (_, id: number) =>
@@ -1186,7 +1307,7 @@ function setupIpcHandlers() {
       autoBackupInterval: 'daily',
       autoBackupLastRun: '',
     }
-    rows.forEach(r => { map[r.key] = r.value })
+    rows.forEach(r => { if (r.key !== 'clearDataPassword') map[r.key] = r.value })
     return map
   })
 
@@ -1323,8 +1444,14 @@ function setupIpcHandlers() {
 
   // ─── JOURNAL ENTRY HELPERS ────────────────────────────────────
   async function nextJENumber() {
-    const count = await prisma.journalEntry.count()
-    return `JE-${String(count + 1).padStart(5, '0')}`
+    const latest = await prisma.journalEntry.aggregate({ _max: { id: true } })
+    let sequence = (latest._max.id ?? 0) + 1
+    let number = `JE-${String(sequence).padStart(5, '0')}`
+    while (await prisma.journalEntry.findUnique({ where: { number } })) {
+      sequence++
+      number = `JE-${String(sequence).padStart(5, '0')}`
+    }
+    return number
   }
 
   async function findAccByCode(code: string) {
@@ -1515,10 +1642,22 @@ function setupIpcHandlers() {
   })
 
   ipcMain.handle('journalEntries:post', async (_, id: number) => {
-    const entry = await prisma.journalEntry.findUnique({ where: { id } })
+    const entry = await prisma.journalEntry.findUnique({
+      where: { id },
+      include: { lines: true },
+    })
     if (!entry) throw new Error('القيد غير موجود')
     if (entry.status === 'posted') throw new Error('القيد مرحل مسبقاً')
-    return prisma.journalEntry.update({ where: { id }, data: { status: 'posted' } })
+    if (entry.lines.length < 2) throw new Error('لا يمكن ترحيل قيد بدون طرفين على الأقل')
+    const debit = entry.lines.reduce((sum, line) => sum + line.debit, 0)
+    const credit = entry.lines.reduce((sum, line) => sum + line.credit, 0)
+    if (Math.abs(debit - credit) > 0.005) throw new Error('القيد غير متوازن: إجمالي المدين لا يساوي إجمالي الدائن')
+    const updated = await prisma.journalEntry.updateMany({
+      where: { id, status: 'draft' },
+      data: { status: 'posted' },
+    })
+    if (updated.count !== 1) throw new Error('تعذر ترحيل القيد؛ ربما تم ترحيله بالفعل')
+    return prisma.journalEntry.findUnique({ where: { id }, include: { lines: { include: { account: true } } } })
   })
 
   ipcMain.handle('journalEntries:delete', async (_, id: number) => {
@@ -1736,46 +1875,49 @@ function setupIpcHandlers() {
   }) {
     const { bankAccountId, type, amount, description, referenceNumber, contraAccountId } = opts
     const date = opts.date ?? new Date()
-    const bankAcc = await prisma.bankAccount.findUnique({ where: { id: bankAccountId } })
-    if (!bankAcc) throw new Error('الحساب غير موجود')
-    const delta      = type === 'deposit' ? amount : -amount
-    const newBalance = bankAcc.currentBalance + delta
-    await prisma.bankAccount.update({ where: { id: bankAccountId }, data: { currentBalance: newBalance } })
+    if (!Number.isFinite(amount) || amount <= 0) throw new Error('قيمة المعاملة يجب أن تكون أكبر من صفر')
+    if (!['deposit', 'withdrawal', 'transfer'].includes(type)) throw new Error('نوع المعاملة غير صالح')
 
-    let journalEntryId: number | null = null
-    if (bankAcc.accountId && contraAccountId) {
-      const jeNumber = await nextJENumber()
-      const isDeposit = type === 'deposit'
-      const je = await prisma.journalEntry.create({
-        data: {
-          number: jeNumber,
-          date,
-          description: description || `${isDeposit ? 'إيداع' : 'سحب'} - ${bankAcc.name}`,
-          status: 'posted',
-          source: 'bank',
-          sourceId: bankAccountId,
-          lines: {
-            create: [
-              // DR side
-              { accountId: isDeposit ? bankAcc.accountId : contraAccountId, debit: amount, credit: 0, description },
-              // CR side
-              { accountId: isDeposit ? contraAccountId : bankAcc.accountId, debit: 0, credit: amount, description },
-            ],
+    return prisma.$transaction(async (tx) => {
+      const bankAcc = await tx.bankAccount.findUnique({ where: { id: bankAccountId } })
+      if (!bankAcc) throw new Error('الحساب غير موجود')
+      const delta = type === 'deposit' ? amount : -amount
+      const newBalance = bankAcc.currentBalance + delta
+      await tx.bankAccount.update({ where: { id: bankAccountId }, data: { currentBalance: newBalance } })
+
+      let journalEntryId: number | null = null
+      if (bankAcc.accountId && contraAccountId) {
+        const jeNumber = await nextJENumber()
+        const isDeposit = type === 'deposit'
+        const je = await tx.journalEntry.create({
+          data: {
+            number: jeNumber,
+            date,
+            description: description || `${isDeposit ? 'إيداع' : 'سحب'} - ${bankAcc.name}`,
+            status: 'posted',
+            source: 'bank',
+            sourceId: bankAccountId,
+            lines: {
+              create: [
+                { accountId: isDeposit ? bankAcc.accountId : contraAccountId, debit: amount, credit: 0, description },
+                { accountId: isDeposit ? contraAccountId : bankAcc.accountId, debit: 0, credit: amount, description },
+              ],
+            },
           },
-        },
-      })
-      journalEntryId = je.id
-    }
+        })
+        journalEntryId = je.id
+      }
 
-    return prisma.bankTransaction.create({
-      data: {
-        bankAccountId, type, amount, balanceAfter: newBalance,
-        description: description ?? null, referenceNumber: referenceNumber ?? null,
-        contraAccountId: contraAccountId ?? null,
-        journalEntryId,
-        date,
-      },
-      include: { bankAccount: { include: { account: true } } },
+      return tx.bankTransaction.create({
+        data: {
+          bankAccountId, type, amount, balanceAfter: newBalance,
+          description: description ?? null, referenceNumber: referenceNumber ?? null,
+          contraAccountId: contraAccountId ?? null,
+          journalEntryId,
+          date,
+        },
+        include: { bankAccount: { include: { account: true } } },
+      })
     })
   }
 
@@ -1786,20 +1928,25 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('bankTransactions:delete', async (_, id: number) => {
-    const tx = await prisma.bankTransaction.findUnique({ where: { id } })
-    if (!tx) throw new Error('المعاملة غير موجودة')
-    const delta = tx.type === 'deposit' ? -tx.amount : tx.amount
-    await prisma.bankAccount.update({ where: { id: tx.bankAccountId }, data: { currentBalance: { increment: delta } } })
-    if (tx.journalEntryId) {
-      await prisma.journalEntry.delete({ where: { id: tx.journalEntryId } }).catch(() => {})
-    }
-    await prisma.bankStatementLine.updateMany({
-      where: { matchedTransactionId: id },
-      data: { matchedTransactionId: null, status: 'unmatched' },
+  ipcMain.handle('bankTransactions:delete', async (_, id: number) =>
+    prisma.$transaction(async (tx) => {
+      const transaction = await tx.bankTransaction.findUnique({ where: { id } })
+      if (!transaction) throw new Error('المعاملة غير موجودة')
+      const delta = transaction.type === 'deposit' ? -transaction.amount : transaction.amount
+      await tx.bankAccount.update({
+        where: { id: transaction.bankAccountId },
+        data: { currentBalance: { increment: delta } },
+      })
+      if (transaction.journalEntryId) {
+        await tx.journalEntry.delete({ where: { id: transaction.journalEntryId } })
+      }
+      await tx.bankStatementLine.updateMany({
+        where: { matchedTransactionId: id },
+        data: { matchedTransactionId: null, status: 'unmatched' },
+      })
+      return tx.bankTransaction.delete({ where: { id } })
     })
-    return prisma.bankTransaction.delete({ where: { id } })
-  })
+  )
 
   // ─── BANK STATEMENT IMPORT & RECONCILIATION ───────────────────
   function detectColumn(headers: string[], candidates: string[]): number {
@@ -2287,74 +2434,170 @@ function setupIpcHandlers() {
   })
 
   // ─── SYSTEM ─────────────────────────────────────────────────────
-  ipcMain.handle('system:clearAllData', async (_, sections?: string[], password?: string) => {
-    const expected = await prisma.setting.findUnique({ where: { key: 'clearDataPassword' } })
-    const pw = expected?.value || 'admin'
-    if (password !== pw) throw new Error('كلمة المرور غير صحيحة')
-    const s = new Set(sections && sections.length ? sections : ['all'])
-    const all = s.has('all')
+  ipcMain.handle('system:clearAllData', async (_, payload: { sections: string[]; userId: number; pin: string }) => {
+    const { sections, userId, pin } = payload || {}
+    if (!Array.isArray(sections) || sections.length === 0) {
+      throw new Error('اختر قسمًا واحدًا على الأقل')
+    }
+    if (!Number.isInteger(userId) || typeof pin !== 'string' || !pin.trim()) {
+      throw new Error('أدخل رقم دخول المدير')
+    }
+
+    // Slow repeated PIN guesses and verify credentials against the database in the main process.
+    const now = Date.now()
+    const failure = clearPinFailures.get(userId)
+    if (failure && failure.lockedUntil > now) {
+      const seconds = Math.ceil((failure.lockedUntil - now) / 1000)
+      throw new Error(`محاولات كثيرة. حاول مرة أخرى بعد ${seconds} ثانية`)
+    }
+    const actor = await prisma.user.findUnique({ where: { id: userId } })
+    if (!actor || !actor.isActive || actor.pin !== pin) {
+      const count = (failure?.count ?? 0) + 1
+      clearPinFailures.set(userId, {
+        count: count >= 5 ? 0 : count,
+        lockedUntil: count >= 5 ? now + 60_000 : 0,
+      })
+      throw new Error(count >= 5 ? 'تم إيقاف المحاولة مؤقتًا لمدة دقيقة' : 'رقم دخول المدير غير صحيح')
+    }
+    clearPinFailures.delete(userId)
+    const role = await prisma.role.findUnique({ where: { name: actor.role } })
+    if (!role || (!role.isSystem && !role.fullAccess)) {
+      throw new Error('هذه العملية متاحة لمدير النظام فقط')
+    }
+
+    const allowed = new Set([
+      'all', 'sales', 'returns', 'purchases', 'stock', 'transfers',
+      'inventory', 'products', 'customers', 'suppliers', 'expenses',
+      'accounting', 'banks',
+    ])
+    const selected = new Set(sections)
+    for (const section of selected) {
+      if (!allowed.has(section)) throw new Error('قسم غير معروف: ' + section)
+    }
+    const all = selected.has('all')
+    if (all && selected.size !== 1) throw new Error('اختيار مسح الجميع لا يقبل أقسامًا إضافية')
+
+    // Removing products requires removing documents that have mandatory product
+    // foreign keys as well. This is intentionally explicit in the confirmation UI.
+    const removeProducts = all || selected.has('products')
+    const removeSales = all || selected.has('sales') || removeProducts
+    const removeReturns = all || selected.has('returns') || removeSales
+    const removePurchases = all || selected.has('purchases') || removeProducts
+    const removeStock = all || selected.has('stock') || removeProducts
+    const removeTransfers = all || selected.has('transfers') || removeProducts
+    const removeInventory = all || selected.has('inventory') || removeProducts
+    const removeExpenses = all || selected.has('expenses')
+    const removeBanks = all || selected.has('banks')
+    const removeAccounting = all || selected.has('accounting')
+
     await prisma.$transaction(async (tx) => {
-      if (all || s.has('sales')) {
+      if (removeReturns) {
         await tx.saleReturnItem.deleteMany({})
         await tx.saleReturn.deleteMany({})
+      }
+      if (removeSales) {
         await tx.posOrderItem.deleteMany({})
         await tx.posOrder.deleteMany({})
+        await tx.journalEntry.deleteMany({ where: { source: 'sale' } })
+      } else if (selected.has('returns')) {
+        // Return journal entries use the shared "sale" source in older database versions.
+        await tx.journalEntry.deleteMany({
+          where: { source: 'sale', description: { contains: 'مرتجع' } },
+        })
       }
-      if (all || s.has('returns')) {
-        await tx.saleReturnItem.deleteMany({})
-        await tx.saleReturn.deleteMany({})
-      }
-      if (all || s.has('purchases')) {
+
+      if (removePurchases) {
         await tx.purchaseItem.deleteMany({})
         await tx.purchaseInvoice.deleteMany({})
         await tx.purchaseRequestItem.deleteMany({})
         await tx.purchaseRequest.deleteMany({})
+        await tx.stockMovement.deleteMany({ where: { type: 'purchase' } })
+        await tx.journalEntry.deleteMany({ where: { source: 'purchase' } })
       }
-      if (all || s.has('stock') || s.has('products')) {
-        await tx.stockMovement.deleteMany({})
-        await tx.warehouseStock.deleteMany({})
-      }
-      if (all || s.has('transfers')) {
+
+      if (removeTransfers) {
         await tx.transferItem.deleteMany({})
         await tx.transfer.deleteMany({})
         await tx.transferRequestItem.deleteMany({})
         await tx.transferRequest.deleteMany({})
+        await tx.stockMovement.deleteMany({ where: { type: 'transfer' } })
       }
-      if (all || s.has('inventory')) {
+
+      if (removeInventory) {
         await tx.inventoryCountItem.deleteMany({})
         await tx.inventoryCount.deleteMany({})
       }
-      if (all || s.has('products')) {
+
+      if (removeStock) {
+        await tx.stockMovement.deleteMany({})
+        await tx.warehouseStock.deleteMany({})
+        if (!removeProducts) {
+          await tx.product.updateMany({ data: { currentStock: 0 } })
+        }
+      }
+
+      if (removeProducts) {
+        await tx.promotionProduct.deleteMany({})
+        await tx.promotion.deleteMany({})
         await tx.productBarcode.deleteMany({})
         await tx.productUnit.deleteMany({})
+        await tx.priceHistory.deleteMany({})
         await tx.product.deleteMany({})
         await tx.category.deleteMany({})
-        await tx.priceHistory.deleteMany({})
       }
-      if (all || s.has('customers')) {
+
+      if (all || selected.has('customers')) {
+        // Preserve sales documents when only the customer master data is cleared.
+        await tx.posOrder.updateMany({ data: { customerId: null } })
         await tx.customer.deleteMany({})
       }
-      if (all || s.has('suppliers')) {
+
+      if (all || selected.has('suppliers')) {
+        // Supplier references are optional; detach them before removing suppliers.
+        await tx.purchaseInvoice.updateMany({ data: { supplierId: null } })
+        await tx.purchaseRequest.updateMany({ data: { supplierId: null } })
         await tx.supplier.deleteMany({})
       }
-      if (all || s.has('expenses')) {
+
+      if (removeExpenses) {
         await tx.expense.deleteMany({})
         await tx.expenseCategory.deleteMany({})
+        await tx.journalEntry.deleteMany({ where: { source: 'expense' } })
       }
-      if (all || s.has('accounting')) {
+
+      if (removeBanks) {
+        await tx.bankTransaction.deleteMany({})
+        await tx.bankStatementLine.deleteMany({})
+        await tx.bankRule.deleteMany({})
+        await tx.journalEntry.deleteMany({ where: { source: 'bank' } })
+        await tx.bankAccount.updateMany({ data: { accountId: null } })
+        await tx.bankAccount.deleteMany({})
+      }
+
+      if (removeAccounting) {
+        // Bank transactions keep an optional scalar link to their journal entry.
+        await tx.bankTransaction.updateMany({ data: { journalEntryId: null } })
         await tx.journalEntryLine.deleteMany({})
         await tx.journalEntry.deleteMany({})
       }
-      if (all || s.has('banks')) {
-        await tx.bankTransaction.deleteMany({})
-        await tx.bankStatementLine.deleteMany({})
-        await tx.bankAccount.deleteMany({})
-      }
+
       if (all) {
         await tx.activityLog.deleteMany({})
       }
-    })
-    try { await prisma.activityLog.create({ data: { userId: 1, action: 'clear', entity: 'system', details: (sections && sections.length ? sections.join(',') : 'all') } }) } catch {}
+    }, { maxWait: 10_000, timeout: 60_000 })
+
+    try {
+      await prisma.activityLog.create({
+        data: {
+          userId: actor.id,
+          action: 'clear',
+          entity: 'system',
+          details: all ? 'all' : [...selected].join(','),
+        },
+      })
+    } catch (error) {
+      console.error('[AuditLog:clear]', error)
+    }
     return { ok: true }
   })
 

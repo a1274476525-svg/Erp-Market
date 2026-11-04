@@ -16,29 +16,19 @@ const Ctx = createContext<AuthCtx>({
 })
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<User | null>(() => {
-    try {
-      const saved = JSON.parse(sessionStorage.getItem('_cu') || 'null')
-      if (saved && (!('roleData' in saved) || saved.roleData === null)) {
-        sessionStorage.removeItem('_cu')
-        return null
-      }
-      return saved
-    } catch { return null }
-  })
+  // Do not trust a renderer-stored user object as an authenticated session.
+  const [user, setUser] = useState<User | null>(null)
 
   async function login(userId: number, pin: string) {
     const result = await window.api.auth.login(userId, pin)
     if (result) {
       setUser(result)
-      sessionStorage.setItem('_cu', JSON.stringify(result))
     }
     return !!result
   }
 
   function logout() {
     setUser(null)
-    sessionStorage.removeItem('_cu')
   }
 
   function canAccess(path: string) {
