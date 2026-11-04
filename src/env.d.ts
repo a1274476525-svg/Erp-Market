@@ -124,6 +124,7 @@ interface Window {
     auth: {
       listUsers: () => Promise<any[]>
       login: (userId: number, pin: string) => Promise<any>
+      logout: () => Promise<boolean>
       getAll: () => Promise<any[]>
       create: (data: any) => Promise<any>
       update: (data: any) => Promise<any>
