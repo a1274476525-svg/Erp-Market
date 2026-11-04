@@ -21,6 +21,7 @@ const prisma = new PrismaClient()
 let mainWindow: BrowserWindow | null = null
 const clearPinFailures = new Map<number, { count: number; lockedUntil: number }>()
 const loginPinFailures = new Map<number, { count: number; lockedUntil: number }>()
+const authenticatedSessions = new Map<number, number>()
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -228,6 +229,73 @@ const STANDARD_ACCOUNTS: { code: string; name: string; type: string; nb: string;
 ]
 
 function setupIpcHandlers() {
+  const publicChannels = new Set(['auth:listUsers', 'auth:login', 'auth:logout', 'settings:getAll'])
+  const mutatingActions = new Set([
+    'create', 'update', 'delete', 'addPoints', 'toggle', 'adjust', 'waste', 'convertUnit',
+    'voidOrder', 'createReturn', 'saveDraft', 'updateDraft', 'deleteDraft', 'confirmDraft',
+    'updateStatus', 'execute', 'close', 'removeItem', 'updateItem', 'post', 'reverse',
+    'backfillMissing', 'seedDefault', 'setDefault', 'syncStock', 'set', 'log', 'ignore',
+    'unmatch', 'import', 'match', 'createFromLine', 'applyRules', 'selectImage', 'removeImage',
+    'selectFolder', 'clearAllData', 'parseFile',
+  ])
+  const permissionPaths = (channel: string): string[] => {
+    const [group, action] = channel.split(':')
+    if (group === 'pos' && action === 'voidOrder') return ['/sales', '/pos']
+    if (group === 'pos' && action === 'createReturn') return ['/returns', '/pos']
+    const paths: Record<string, string[]> = {
+      products: ['/products'], productBarcodes: ['/products'], productUnits: ['/products'],
+      categories: ['/categories'], customers: ['/customers'], suppliers: ['/suppliers'],
+      invoices: ['/invoices'], purchaseRequests: ['/purchase-requests'], promotions: ['/promotions'],
+      pos: ['/pos'], stock: ['/stock'], branches: ['/branches'], warehouses: ['/branches'],
+      transferRequests: ['/transfer-requests'], transfers: ['/transfers'], inventory: ['/inventory'],
+      auth: ['/users'], roles: ['/roles'], settings: ['/settings'], backup: ['/settings'],
+      system: ['/settings'], expenses: ['/expenses'], expenseCategories: ['/expenses'],
+      accounts: ['/chart-of-accounts'], journalEntries: ['/journal-entries'],
+      bankAccounts: ['/banks'], bankTransactions: ['/banks'], bankStatements: ['/banks'],
+      bankRules: ['/banks'], reports: ['/reports', '/financial-reports'],
+    }
+    if (group === 'activity' && action === 'log') return []
+    if (group === 'warehouses' && action === 'init') return []
+    if (group === 'reports' && action === 'financial') return ['/financial-reports']
+    return paths[group] ?? []
+  }
+  const ipcHandle = (channel: string, handler: (...args: any[]) => any) => {
+    ipcMain.handle(channel, async (event, ...args) => {
+      if (channel === 'auth:logout') {
+        authenticatedSessions.delete(event.sender.id)
+        return handler(event, ...args)
+      }
+      if (publicChannels.has(channel)) return handler(event, ...args)
+      if (channel === 'auth:create' && await prisma.user.count() === 0) {
+        return handler(event, ...args)
+      }
+
+      const userId = authenticatedSessions.get(event.sender.id)
+      if (!userId) throw new Error('انتهت جلسة الدخول. سجل الدخول مرة أخرى')
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { role: true, isActive: true },
+      })
+      if (!user?.isActive) {
+        authenticatedSessions.delete(event.sender.id)
+        throw new Error('الحساب غير نشط. سجل الدخول بحساب آخر')
+      }
+      const role = await resolveRole(user.role)
+      if (!role) throw new Error('دور المستخدم غير موجود')
+
+      const action = channel.split(':')[1] ?? ''
+      if (mutatingActions.has(action) && !role.fullAccess) {
+        const allowedPaths = permissionPaths(channel)
+        if (allowedPaths.length > 0 && !allowedPaths.some(path =>
+          role.permissions.some(permission => path === permission || path.startsWith(permission + '/'))
+        )) {
+          throw new Error('ليس لديك صلاحية لتنفيذ هذه العملية')
+        }
+      }
+      return handler(event, ...args)
+    })
+  }
+
   async function getDefaultWarehouse(tx: Prisma.TransactionClient) {
     let branch = await tx.branch.findFirst({ where: { isDefault: true } })
     if (!branch) {
@@ -307,7 +375,7 @@ function setupIpcHandlers() {
   }
 
   // ─── PRODUCTS ──────────────────────────────────────────────────
-  ipcMain.handle('products:getAll', (_, includeInactive = false) =>
+  ipcHandle('products:getAll', (_, includeInactive = false) =>
     prisma.product.findMany({
       where: includeInactive ? undefined : { isActive: true },
       include: { category: true },
@@ -315,35 +383,35 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('products:getByBarcode', async (_, barcode: string) => {
+  ipcHandle('products:getByBarcode', async (_, barcode: string) => {
     const pb = await prisma.productBarcode.findUnique({ where: { barcode }, include: { product: { include: { category: true } } } })
     if (pb) return { ...pb.product, _barcodeUnit: pb.unit, _conversionFactor: pb.conversionFactor }
     return prisma.product.findUnique({ where: { barcode }, include: { category: true } })
   })
 
-  ipcMain.handle('productBarcodes:getByProduct', (_, productId: number) =>
+  ipcHandle('productBarcodes:getByProduct', (_, productId: number) =>
     prisma.productBarcode.findMany({ where: { productId }, orderBy: { createdAt: 'asc' } })
   )
-  ipcMain.handle('productBarcodes:create', (_, data) =>
+  ipcHandle('productBarcodes:create', (_, data) =>
     prisma.productBarcode.create({ data })
   )
-  ipcMain.handle('productBarcodes:update', (_, { id, ...data }) =>
+  ipcHandle('productBarcodes:update', (_, { id, ...data }) =>
     prisma.productBarcode.update({ where: { id }, data })
   )
-  ipcMain.handle('productBarcodes:delete', (_, id: number) =>
+  ipcHandle('productBarcodes:delete', (_, id: number) =>
     prisma.productBarcode.delete({ where: { id } })
   )
 
-  ipcMain.handle('productUnits:getByProduct', (_, productId: number) =>
+  ipcHandle('productUnits:getByProduct', (_, productId: number) =>
     prisma.productUnit.findMany({ where: { productId }, orderBy: { level: 'asc' } })
   )
-  ipcMain.handle('productUnits:create', (_, data) =>
+  ipcHandle('productUnits:create', (_, data) =>
     prisma.productUnit.create({ data })
   )
-  ipcMain.handle('productUnits:update', (_, { id, ...data }) =>
+  ipcHandle('productUnits:update', (_, { id, ...data }) =>
     prisma.productUnit.update({ where: { id }, data })
   )
-  ipcMain.handle('productUnits:delete', (_, id: number) =>
+  ipcHandle('productUnits:delete', (_, id: number) =>
     prisma.productUnit.delete({ where: { id } })
   )
 
@@ -357,7 +425,7 @@ function setupIpcHandlers() {
     return `PRD-${String(num).padStart(4, '0')}`
   }
 
-  ipcMain.handle('products:create', async (_, data) =>
+  ipcHandle('products:create', async (_, data) =>
     prisma.$transaction(async (tx) => {
       const sku = data.sku || await nextSku()
       const initialStock = Number(data.currentStock ?? 0)
@@ -384,7 +452,7 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('products:update', async (_, { id, ...data }) => {
+  ipcHandle('products:update', async (_, { id, ...data }) => {
     const old = await prisma.product.findUnique({ where: { id } })
     if (old && data.costPrice !== undefined && data.costPrice !== old.costPrice) {
       await prisma.priceHistory.create({
@@ -394,11 +462,11 @@ function setupIpcHandlers() {
     return prisma.product.update({ where: { id }, data })
   })
 
-  ipcMain.handle('products:delete', (_, id: number) =>
+  ipcHandle('products:delete', (_, id: number) =>
     prisma.product.delete({ where: { id } })
   )
 
-  ipcMain.handle('products:getPriceHistory', (_, productId: number) =>
+  ipcHandle('products:getPriceHistory', (_, productId: number) =>
     prisma.priceHistory.findMany({
       where: { productId },
       orderBy: { date: 'desc' },
@@ -406,7 +474,7 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('products:selectImage', async (_, id: number) => {
+  ipcHandle('products:selectImage', async (_, id: number) => {
     const result = await dialog.showOpenDialog(mainWindow!, {
       filters: [{ name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'webp'] }],
       properties: ['openFile'],
@@ -417,11 +485,11 @@ function setupIpcHandlers() {
     return imgPath
   })
 
-  ipcMain.handle('products:removeImage', async (_, id: number) => {
+  ipcHandle('products:removeImage', async (_, id: number) => {
     await prisma.product.update({ where: { id }, data: { imagePath: null } })
   })
 
-  ipcMain.handle('products:getImageData', async (_, imgPath: string) => {
+  ipcHandle('products:getImageData', async (_, imgPath: string) => {
     try {
       const { readFile } = await import('node:fs/promises')
       const buf  = await readFile(imgPath)
@@ -432,40 +500,40 @@ function setupIpcHandlers() {
   })
 
   // ─── CATEGORIES ────────────────────────────────────────────────
-  ipcMain.handle('categories:getAll', () =>
+  ipcHandle('categories:getAll', () =>
     prisma.category.findMany({ orderBy: { name: 'asc' } })
   )
 
-  ipcMain.handle('categories:create', (_, data) =>
+  ipcHandle('categories:create', (_, data) =>
     prisma.category.create({ data })
   )
 
-  ipcMain.handle('categories:update', (_, { id, ...data }) =>
+  ipcHandle('categories:update', (_, { id, ...data }) =>
     prisma.category.update({ where: { id }, data })
   )
 
-  ipcMain.handle('categories:delete', (_, id: number) =>
+  ipcHandle('categories:delete', (_, id: number) =>
     prisma.category.delete({ where: { id } })
   )
 
   // ─── CUSTOMERS ─────────────────────────────────────────────────
-  ipcMain.handle('customers:getAll', () =>
+  ipcHandle('customers:getAll', () =>
     prisma.customer.findMany({ orderBy: { name: 'asc' } })
   )
 
-  ipcMain.handle('customers:create', (_, data) =>
+  ipcHandle('customers:create', (_, data) =>
     prisma.customer.create({ data })
   )
 
-  ipcMain.handle('customers:update', (_, { id, ...data }) =>
+  ipcHandle('customers:update', (_, { id, ...data }) =>
     prisma.customer.update({ where: { id }, data })
   )
 
-  ipcMain.handle('customers:delete', (_, id: number) =>
+  ipcHandle('customers:delete', (_, id: number) =>
     prisma.customer.delete({ where: { id } })
   )
 
-  ipcMain.handle('customers:addPoints', (_, { id, points }: { id: number; points: number }) =>
+  ipcHandle('customers:addPoints', (_, { id, points }: { id: number; points: number }) =>
     prisma.customer.update({
       where: { id },
       data: { loyaltyPoints: { increment: points } },
@@ -473,24 +541,24 @@ function setupIpcHandlers() {
   )
 
   // ─── SUPPLIERS ─────────────────────────────────────────────────
-  ipcMain.handle('suppliers:getAll', () =>
+  ipcHandle('suppliers:getAll', () =>
     prisma.supplier.findMany({ orderBy: { name: 'asc' } })
   )
 
-  ipcMain.handle('suppliers:create', (_, data) =>
+  ipcHandle('suppliers:create', (_, data) =>
     prisma.supplier.create({ data })
   )
 
-  ipcMain.handle('suppliers:update', (_, { id, ...data }) =>
+  ipcHandle('suppliers:update', (_, { id, ...data }) =>
     prisma.supplier.update({ where: { id }, data })
   )
 
-  ipcMain.handle('suppliers:delete', (_, id: number) =>
+  ipcHandle('suppliers:delete', (_, id: number) =>
     prisma.supplier.delete({ where: { id } })
   )
 
   // ─── PURCHASE INVOICES ─────────────────────────────────────────
-  ipcMain.handle('invoices:getAll', () =>
+  ipcHandle('invoices:getAll', () =>
     prisma.purchaseInvoice.findMany({
       where: { status: 'confirmed' },
       include: { supplier: true, items: { include: { product: true } } },
@@ -498,7 +566,7 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('invoices:getDrafts', () =>
+  ipcHandle('invoices:getDrafts', () =>
     prisma.purchaseInvoice.findMany({
       where: { status: 'draft' },
       include: { supplier: true, items: { include: { product: true } } },
@@ -506,7 +574,7 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('invoices:create', async (_, { items, ...header }) => {
+  ipcHandle('invoices:create', async (_, { items, ...header }) => {
     if (!Array.isArray(items) || items.length === 0) throw new Error('أضف أصناف فاتورة الشراء')
     const invoice = await prisma.$transaction(async (tx) => {
       const warehouse = await getDefaultWarehouse(tx)
@@ -536,13 +604,13 @@ function setupIpcHandlers() {
     return invoice
   })
 
-  ipcMain.handle('invoices:saveDraft', (_, { items, ...header }) =>
+  ipcHandle('invoices:saveDraft', (_, { items, ...header }) =>
     prisma.purchaseInvoice.create({
       data: { ...header, status: 'draft', items: { create: items } },
     })
   )
 
-  ipcMain.handle('invoices:updateDraft', (_, { id, items, ...header }) =>
+  ipcHandle('invoices:updateDraft', (_, { id, items, ...header }) =>
     prisma.purchaseInvoice.update({
       where: { id },
       data: {
@@ -552,11 +620,11 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('invoices:deleteDraft', (_, id: number) =>
+  ipcHandle('invoices:deleteDraft', (_, id: number) =>
     prisma.purchaseInvoice.delete({ where: { id, status: 'draft' } })
   )
 
-  ipcMain.handle('invoices:confirmDraft', async (_, id: number) => {
+  ipcHandle('invoices:confirmDraft', async (_, id: number) => {
     const invoice = await prisma.$transaction(async (tx) => {
       const claimed = await tx.purchaseInvoice.updateMany({
         where: { id, status: 'draft' },
@@ -590,36 +658,36 @@ function setupIpcHandlers() {
   })
 
   // ─── PURCHASE REQUESTS ─────────────────────────────────────────
-  ipcMain.handle('purchaseRequests:getAll', () =>
+  ipcHandle('purchaseRequests:getAll', () =>
     prisma.purchaseRequest.findMany({
       include: { supplier: true, items: { include: { product: true } } },
       orderBy: { requestDate: 'desc' },
     })
   )
 
-  ipcMain.handle('purchaseRequests:create', (_, { items, ...data }) =>
+  ipcHandle('purchaseRequests:create', (_, { items, ...data }) =>
     prisma.purchaseRequest.create({
       data: { ...data, items: { create: items } },
     })
   )
 
-  ipcMain.handle('purchaseRequests:updateStatus', (_, { id, status }: { id: number; status: string }) =>
+  ipcHandle('purchaseRequests:updateStatus', (_, { id, status }: { id: number; status: string }) =>
     prisma.purchaseRequest.update({ where: { id }, data: { status } })
   )
 
-  ipcMain.handle('purchaseRequests:delete', (_, id: number) =>
+  ipcHandle('purchaseRequests:delete', (_, id: number) =>
     prisma.purchaseRequest.delete({ where: { id } })
   )
 
   // ─── PROMOTIONS ────────────────────────────────────────────────
-  ipcMain.handle('promotions:getAll', () =>
+  ipcHandle('promotions:getAll', () =>
     prisma.promotion.findMany({
       include: { products: { include: { product: true } } },
       orderBy: { createdAt: 'desc' },
     })
   )
 
-  ipcMain.handle('promotions:create', (_, { productIds, ...data }) =>
+  ipcHandle('promotions:create', (_, { productIds, ...data }) =>
     prisma.promotion.create({
       data: {
         ...data,
@@ -630,7 +698,7 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('promotions:update', (_, { id, productIds, ...data }) =>
+  ipcHandle('promotions:update', (_, { id, productIds, ...data }) =>
     prisma.promotion.update({
       where: { id },
       data: {
@@ -642,18 +710,18 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('promotions:toggle', (_, id: number) =>
+  ipcHandle('promotions:toggle', (_, id: number) =>
     prisma.promotion.findUnique({ where: { id } }).then(p =>
       prisma.promotion.update({ where: { id }, data: { isActive: !p?.isActive } })
     )
   )
 
-  ipcMain.handle('promotions:delete', (_, id: number) =>
+  ipcHandle('promotions:delete', (_, id: number) =>
     prisma.promotion.delete({ where: { id } })
   )
 
   // ─── POS ───────────────────────────────────────────────────────
-  ipcMain.handle('pos:createOrder', async (_, { items, customerId, ...header }) => {
+  ipcHandle('pos:createOrder', async (_, { items, customerId, ...header }) => {
     if (!Array.isArray(items) || items.length === 0) throw new Error('أضف صنفًا واحدًا على الأقل')
     for (const item of items) {
       if (!Number.isInteger(item.productId) || !Number.isFinite(item.quantity) || item.quantity <= 0) {
@@ -697,7 +765,7 @@ function setupIpcHandlers() {
     return order
   })
 
-  ipcMain.handle('pos:getOrders', (_, limit = 100) =>
+  ipcHandle('pos:getOrders', (_, limit = 100) =>
     prisma.posOrder.findMany({
       include: { items: { include: { product: true } }, customer: true },
       orderBy: { createdAt: 'desc' },
@@ -705,7 +773,7 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('pos:voidOrder', async (_, id: number) => {
+  ipcHandle('pos:voidOrder', async (_, id: number) => {
     const order = await prisma.$transaction(async (tx) => {
       const current = await tx.posOrder.findUnique({
         where: { id },
@@ -762,7 +830,7 @@ function setupIpcHandlers() {
     return order
   })
 
-  ipcMain.handle('pos:createReturn', async (_, { orderId, items, reason }) => {
+  ipcHandle('pos:createReturn', async (_, { orderId, items, reason }) => {
     if (!Array.isArray(items) || items.length === 0) throw new Error('حدد أصناف المرتجع')
     const ret = await prisma.$transaction(async (tx) => {
       const order = await tx.posOrder.findUnique({
@@ -859,7 +927,7 @@ function setupIpcHandlers() {
     return ret
   })
 
-  ipcMain.handle('pos:getReturns', () =>
+  ipcHandle('pos:getReturns', () =>
     prisma.saleReturn.findMany({
       include: { order: true, items: { include: { product: true } } },
       orderBy: { returnDate: 'desc' },
@@ -867,7 +935,7 @@ function setupIpcHandlers() {
   )
 
   // ─── STOCK ─────────────────────────────────────────────────────
-  ipcMain.handle('stock:getMovements', (_, productId?: number) =>
+  ipcHandle('stock:getMovements', (_, productId?: number) =>
     prisma.stockMovement.findMany({
       where: productId ? { productId } : undefined,
       include: { product: true },
@@ -876,7 +944,7 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('stock:adjust', async (_, { productId, quantity, note }: { productId: number; quantity: number; note?: string }) =>
+  ipcHandle('stock:adjust', async (_, { productId, quantity, note }: { productId: number; quantity: number; note?: string }) =>
     prisma.$transaction(async (tx) => {
       if (!Number.isFinite(quantity) || quantity === 0) throw new Error('الكمية يجب أن تكون رقمًا غير صفري')
       const warehouse = await getDefaultWarehouse(tx)
@@ -885,7 +953,7 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('stock:waste', async (_, { productId, quantity, note }: { productId: number; quantity: number; note?: string }) =>
+  ipcHandle('stock:waste', async (_, { productId, quantity, note }: { productId: number; quantity: number; note?: string }) =>
     prisma.$transaction(async (tx) => {
       if (!Number.isFinite(quantity) || quantity <= 0) throw new Error('كمية الهالك يجب أن تكون أكبر من صفر')
       const warehouse = await getDefaultWarehouse(tx)
@@ -894,7 +962,7 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('stock:convertUnit', async (_, { productId, fromUnit, toUnit, quantity, factor, userId, note }: { productId: number; fromUnit: string; toUnit: string; quantity: number; factor: number; userId?: number; note?: string }) => {
+  ipcHandle('stock:convertUnit', async (_, { productId, fromUnit, toUnit, quantity, factor, userId, note }: { productId: number; fromUnit: string; toUnit: string; quantity: number; factor: number; userId?: number; note?: string }) => {
     // Conversion between packaging units does not change total base stock;
     // it is recorded as an auditable movement for traceability.
     await prisma.stockMovement.create({
@@ -903,7 +971,7 @@ function setupIpcHandlers() {
     return { ok: true }
   })
 
-  ipcMain.handle('stock:getWaste', () =>
+  ipcHandle('stock:getWaste', () =>
     prisma.stockMovement.findMany({
       where: { type: 'waste' },
       include: { product: true },
@@ -912,14 +980,14 @@ function setupIpcHandlers() {
   )
 
   // ─── BRANCHES ──────────────────────────────────────────────────
-  ipcMain.handle('branches:getAll', () =>
+  ipcHandle('branches:getAll', () =>
     prisma.branch.findMany({
       include: { warehouses: true },
       orderBy: { name: 'asc' },
     })
   )
 
-  ipcMain.handle('branches:create', async (_, data) =>
+  ipcHandle('branches:create', async (_, data) =>
     prisma.$transaction(async (tx) => {
       const branch = await tx.branch.create({ data: { ...data, isDefault: false } })
       await tx.warehouse.create({ data: { name: 'المخزن الرئيسي', branchId: branch.id, isDefault: true } })
@@ -927,7 +995,7 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('branches:setDefault', async (_, id: number) =>
+  ipcHandle('branches:setDefault', async (_, id: number) =>
     prisma.$transaction(async (tx) => {
       const branch = await tx.branch.findUnique({ where: { id } })
       if (!branch) throw new Error('الفرع غير موجود')
@@ -946,11 +1014,11 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('branches:update', (_, { id, ...data }) =>
+  ipcHandle('branches:update', (_, { id, ...data }) =>
     prisma.branch.update({ where: { id }, data })
   )
 
-  ipcMain.handle('branches:delete', async (_, id: number) => {
+  ipcHandle('branches:delete', async (_, id: number) => {
     const branch = await prisma.branch.findUnique({ where: { id }, include: { warehouses: true } })
     if (!branch) throw new Error('الفرع غير موجود')
     if (branch.isDefault) throw new Error('لا يمكن حذف الفرع الرئيسي')
@@ -959,21 +1027,21 @@ function setupIpcHandlers() {
   })
 
   // ─── WAREHOUSES ────────────────────────────────────────────────
-  ipcMain.handle('warehouses:init', async () =>
+  ipcHandle('warehouses:init', async () =>
     prisma.$transaction(async (tx) => {
       await getDefaultWarehouse(tx)
       return true
     })
   )
 
-  ipcMain.handle('warehouses:getAll', () =>
+  ipcHandle('warehouses:getAll', () =>
     prisma.warehouse.findMany({
       include: { branch: true, stocks: { include: { product: true } } },
       orderBy: { name: 'asc' },
     })
   )
 
-  ipcMain.handle('warehouses:create', async (_, data) =>
+  ipcHandle('warehouses:create', async (_, data) =>
     prisma.$transaction(async (tx) => {
       const warehouse = await tx.warehouse.create({ data: { ...data, isDefault: false } })
       const products = await tx.product.findMany({ select: { id: true } })
@@ -988,11 +1056,11 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('warehouses:update', (_, { id, ...data }) =>
+  ipcHandle('warehouses:update', (_, { id, ...data }) =>
     prisma.warehouse.update({ where: { id }, data })
   )
 
-  ipcMain.handle('warehouses:delete', async (_, id: number) =>
+  ipcHandle('warehouses:delete', async (_, id: number) =>
     prisma.$transaction(async (tx) => {
       const warehouse = await tx.warehouse.findUnique({
         where: { id },
@@ -1016,7 +1084,7 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('warehouses:setDefault', async (_, id: number) =>
+  ipcHandle('warehouses:setDefault', async (_, id: number) =>
     prisma.$transaction(async (tx) => {
       const warehouse = await tx.warehouse.findUnique({ where: { id } })
       if (!warehouse) throw new Error('المخزن غير موجود')
@@ -1038,7 +1106,7 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('warehouses:syncStock', async (_, warehouseId: number) =>
+  ipcHandle('warehouses:syncStock', async (_, warehouseId: number) =>
     prisma.$transaction(async (tx) => {
       const warehouse = await tx.warehouse.findUnique({ where: { id: warehouseId } })
       if (!warehouse) throw new Error('المخزن غير موجود')
@@ -1055,7 +1123,7 @@ function setupIpcHandlers() {
   )
 
   // ─── TRANSFER REQUESTS ─────────────────────────────────────────
-  ipcMain.handle('transferRequests:getAll', () =>
+  ipcHandle('transferRequests:getAll', () =>
     prisma.transferRequest.findMany({
       include: {
         fromWarehouse: { include: { branch: true } },
@@ -1067,7 +1135,7 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('transferRequests:create', async (_, { items, ...data }) => {
+  ipcHandle('transferRequests:create', async (_, { items, ...data }) => {
     const count = await prisma.transferRequest.count()
     const ref   = `TRQ-${String(count + 1).padStart(5, '0')}`
     return prisma.transferRequest.create({
@@ -1075,16 +1143,16 @@ function setupIpcHandlers() {
     })
   })
 
-  ipcMain.handle('transferRequests:updateStatus', (_, { id, status }: { id: number; status: string }) =>
+  ipcHandle('transferRequests:updateStatus', (_, { id, status }: { id: number; status: string }) =>
     prisma.transferRequest.update({ where: { id }, data: { status } })
   )
 
-  ipcMain.handle('transferRequests:delete', (_, id: number) =>
+  ipcHandle('transferRequests:delete', (_, id: number) =>
     prisma.transferRequest.delete({ where: { id } })
   )
 
   // ─── TRANSFERS ─────────────────────────────────────────────────
-  ipcMain.handle('transfers:getAll', () =>
+  ipcHandle('transfers:getAll', () =>
     prisma.transfer.findMany({
       include: {
         fromWarehouse: { include: { branch: true } },
@@ -1096,7 +1164,7 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('transfers:execute', async (_, requestId: number) =>
+  ipcHandle('transfers:execute', async (_, requestId: number) =>
     prisma.$transaction(async (tx) => {
       const req = await tx.transferRequest.findUnique({
         where: { id: requestId },
@@ -1136,7 +1204,7 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('transfers:createDirect', async (_, { items, ...data }) =>
+  ipcHandle('transfers:createDirect', async (_, { items, ...data }) =>
     prisma.$transaction(async (tx) => {
       if (!Array.isArray(items) || items.length === 0) throw new Error('أضف أصناف التحويل')
       if (data.fromWarehouseId === data.toWarehouseId) throw new Error('لا يمكن التحويل إلى نفس المخزن')
@@ -1161,7 +1229,7 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('transfers:delete', async (_, id: number) =>
+  ipcHandle('transfers:delete', async (_, id: number) =>
     prisma.$transaction(async (tx) => {
       const transfer = await tx.transfer.findUnique({ where: { id }, include: { items: true } })
       if (!transfer) throw new Error('التحويل غير موجود')
@@ -1181,20 +1249,20 @@ function setupIpcHandlers() {
   )
 
   // ─── INVENTORY COUNT ───────────────────────────────────────────
-  ipcMain.handle('inventory:getAll', () =>
+  ipcHandle('inventory:getAll', () =>
     prisma.inventoryCount.findMany({
       include: { items: { include: { product: true } } },
       orderBy: { createdAt: 'desc' },
     })
   )
 
-  ipcMain.handle('inventory:create', async () => {
+  ipcHandle('inventory:create', async () => {
     const count = await prisma.inventoryCount.count()
     const ref   = `INV-${String(count + 1).padStart(5, '0')}`
     return prisma.inventoryCount.create({ data: { referenceNumber: ref } })
   })
 
-  ipcMain.handle('inventory:addItems', async (_, { inventoryCountId, productIds }: { inventoryCountId: number; productIds: number[] }) => {
+  ipcHandle('inventory:addItems', async (_, { inventoryCountId, productIds }: { inventoryCountId: number; productIds: number[] }) => {
     await prisma.$transaction(async (tx) => {
       const count = await tx.inventoryCount.findUnique({ where: { id: inventoryCountId } })
       if (!count || count.status === 'closed') throw new Error('الجرد غير موجود أو مغلق')
@@ -1217,15 +1285,15 @@ function setupIpcHandlers() {
     })
   })
 
-  ipcMain.handle('inventory:removeItem', (_, id: number) =>
+  ipcHandle('inventory:removeItem', (_, id: number) =>
     prisma.inventoryCountItem.delete({ where: { id } })
   )
 
-  ipcMain.handle('inventory:updateItem', (_, { id, actualQuantity }: { id: number; actualQuantity: number }) =>
+  ipcHandle('inventory:updateItem', (_, { id, actualQuantity }: { id: number; actualQuantity: number }) =>
     prisma.inventoryCountItem.update({ where: { id }, data: { actualQuantity } })
   )
 
-  ipcMain.handle('inventory:close', async (_, id: number) =>
+  ipcHandle('inventory:close', async (_, id: number) =>
     prisma.$transaction(async (tx) => {
       const count = await tx.inventoryCount.findUnique({
         where: { id },
@@ -1258,12 +1326,12 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('inventory:delete', (_, id: number) =>
+  ipcHandle('inventory:delete', (_, id: number) =>
     prisma.inventoryCount.delete({ where: { id } })
   )
 
   // ─── REPORTS ───────────────────────────────────────────────────
-  ipcMain.handle('reports:dashboard', async () => {
+  ipcHandle('reports:dashboard', async () => {
     const today = new Date(); today.setHours(0, 0, 0, 0)
 
     const [productCount, allActiveProducts, todayOrders, recentOrders, customerCount, pendingPurchaseReqs, draftInvoices] = await Promise.all([
@@ -1317,7 +1385,7 @@ function setupIpcHandlers() {
     }
   })
 
-  ipcMain.handle('reports:sales', async (_, { from, to, paymentMethod, categoryId, productId }: any) => {
+  ipcHandle('reports:sales', async (_, { from, to, paymentMethod, categoryId, productId }: any) => {
     const where: any = { status: 'completed' }
     if (from) {
       const d = new Date(from); d.setUTCHours(0, 0, 0, 0)
@@ -1342,7 +1410,7 @@ function setupIpcHandlers() {
     })
   })
 
-  ipcMain.handle('reports:purchases', async (_, { from, to, supplierId }: any) => {
+  ipcHandle('reports:purchases', async (_, { from, to, supplierId }: any) => {
     const where: any = {}
     if (from) {
       const d = new Date(from); d.setUTCHours(0, 0, 0, 0)
@@ -1361,7 +1429,7 @@ function setupIpcHandlers() {
     })
   })
 
-  ipcMain.handle('reports:products', async () => {
+  ipcHandle('reports:products', async () => {
     const products = await prisma.product.findMany({
       where: { isActive: true },
       include: { category: true },
@@ -1373,7 +1441,7 @@ function setupIpcHandlers() {
     }))
   })
 
-  ipcMain.handle('reports:stock', async () => {
+  ipcHandle('reports:stock', async () => {
     return prisma.product.findMany({
       where: { isActive: true },
       include: { category: true },
@@ -1382,7 +1450,7 @@ function setupIpcHandlers() {
   })
 
   // ─── AUTH / USERS ──────────────────────────────────────────────
-  ipcMain.handle('auth:listUsers', () =>
+  ipcHandle('auth:listUsers', () =>
     prisma.user.findMany({
       where: { isActive: true },
       select: { id: true, name: true, role: true },
@@ -1390,7 +1458,7 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('auth:login', async (_, userId: number, pin: string) => {
+  ipcHandle('auth:login', async (event, userId: number, pin: string) => {
     if (!Number.isInteger(userId) || typeof pin !== 'string') return null
     const now = Date.now()
     const failure = loginPinFailures.get(userId)
@@ -1410,25 +1478,31 @@ function setupIpcHandlers() {
     loginPinFailures.delete(userId)
     const roleData = await resolveRole(user.role)
     if (!roleData) return null
+    authenticatedSessions.set(event.sender.id, user.id)
     return { ...user, roleData }
   })
 
+  ipcHandle('auth:logout', (event) => {
+    authenticatedSessions.delete(event.sender.id)
+    return true
+  })
+
   // Never send stored PINs to the renderer.
-  ipcMain.handle('auth:getAll', () =>
+  ipcHandle('auth:getAll', () =>
     prisma.user.findMany({
       select: { id: true, name: true, role: true, isActive: true, createdAt: true },
       orderBy: { name: 'asc' },
     })
   )
 
-  ipcMain.handle('auth:create', (_, data) =>
+  ipcHandle('auth:create', (_, data) =>
     prisma.user.create({
       data,
       select: { id: true, name: true, role: true, isActive: true, createdAt: true },
     })
   )
 
-  ipcMain.handle('auth:update', (_, { id, ...data }) =>
+  ipcHandle('auth:update', (_, { id, ...data }) =>
     prisma.user.update({
       where: { id },
       data,
@@ -1436,32 +1510,32 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('auth:delete', (_, id: number) =>
+  ipcHandle('auth:delete', (_, id: number) =>
     prisma.user.delete({ where: { id } })
   )
 
   // ─── ROLES ─────────────────────────────────────────────────────
-  ipcMain.handle('roles:getAll', async () => {
+  ipcHandle('roles:getAll', async () => {
     const roles = await prisma.role.findMany({ orderBy: { name: 'asc' } })
     return roles.map(r => ({ ...r, permissions: JSON.parse(r.permissions || '[]') }))
   })
 
-  ipcMain.handle('roles:create', (_, { permissions, ...data }) =>
+  ipcHandle('roles:create', (_, { permissions, ...data }) =>
     prisma.role.create({ data: { ...data, permissions: JSON.stringify(permissions || []) } })
   )
 
-  ipcMain.handle('roles:update', (_, { id, permissions, ...data }) =>
+  ipcHandle('roles:update', (_, { id, permissions, ...data }) =>
     prisma.role.update({ where: { id }, data: { ...data, permissions: JSON.stringify(permissions || []) } })
   )
 
-  ipcMain.handle('roles:delete', async (_, id: number) => {
+  ipcHandle('roles:delete', async (_, id: number) => {
     const role = await prisma.role.findUnique({ where: { id } })
     if (role?.isSystem) throw new Error('لا يمكن حذف دور النظام')
     return prisma.role.delete({ where: { id } })
   })
 
   // ─── SETTINGS ──────────────────────────────────────────────────
-  ipcMain.handle('settings:getAll', async () => {
+  ipcHandle('settings:getAll', async () => {
     const rows = await prisma.setting.findMany()
     const map: Record<string, string> = {
       storeName: 'يو ماركت',
@@ -1476,7 +1550,7 @@ function setupIpcHandlers() {
     return map
   })
 
-  ipcMain.handle('settings:set', (_, key: string, value: string) =>
+  ipcHandle('settings:set', (_, key: string, value: string) =>
     prisma.setting.upsert({
       where:  { key },
       update: { value },
@@ -1485,11 +1559,11 @@ function setupIpcHandlers() {
   )
 
   // ─── ACTIVITY LOG ──────────────────────────────────────────────
-  ipcMain.handle('activity:log', (_, { userId, action, entity, entityId, details }) =>
+  ipcHandle('activity:log', (_, { userId, action, entity, entityId, details }) =>
     prisma.activityLog.create({ data: { userId, action, entity, entityId, details } })
   )
 
-  ipcMain.handle('activity:getAll', () =>
+  ipcHandle('activity:getAll', () =>
     prisma.activityLog.findMany({
       include: { user: { select: { id: true, name: true, role: true } } },
       orderBy: { createdAt: 'desc' },
@@ -1498,23 +1572,23 @@ function setupIpcHandlers() {
   )
 
   // ─── EXPENSES ──────────────────────────────────────────────────
-  ipcMain.handle('expenseCategories:getAll', () =>
+  ipcHandle('expenseCategories:getAll', () =>
     prisma.expenseCategory.findMany({ orderBy: { name: 'asc' } })
   )
 
-  ipcMain.handle('expenseCategories:create', (_, data) =>
+  ipcHandle('expenseCategories:create', (_, data) =>
     prisma.expenseCategory.create({ data })
   )
 
-  ipcMain.handle('expenseCategories:update', (_, { id, ...data }) =>
+  ipcHandle('expenseCategories:update', (_, { id, ...data }) =>
     prisma.expenseCategory.update({ where: { id }, data })
   )
 
-  ipcMain.handle('expenseCategories:delete', (_, id: number) =>
+  ipcHandle('expenseCategories:delete', (_, id: number) =>
     prisma.expenseCategory.delete({ where: { id } })
   )
 
-  ipcMain.handle('expenses:getAll', (_, { from, to, categoryId }: { from?: string; to?: string; categoryId?: number } = {}) => {
+  ipcHandle('expenses:getAll', (_, { from, to, categoryId }: { from?: string; to?: string; categoryId?: number } = {}) => {
     const where: any = {}
     if (from) { const d = new Date(from); d.setUTCHours(0, 0, 0, 0); where.date = { ...where.date, gte: d } }
     if (to)   { const d = new Date(to);   d.setUTCDate(d.getUTCDate() + 1); d.setUTCHours(0, 0, 0, 0); where.date = { ...where.date, lt: d } }
@@ -1526,7 +1600,7 @@ function setupIpcHandlers() {
     })
   })
 
-  ipcMain.handle('expenses:create', async (_, data) => {
+  ipcHandle('expenses:create', async (_, data) => {
     const expense = await prisma.expense.create({ data, include: { category: true } })
 
     try {
@@ -1541,28 +1615,28 @@ function setupIpcHandlers() {
     return expense
   })
 
-  ipcMain.handle('expenses:update', (_, { id, ...data }) =>
+  ipcHandle('expenses:update', (_, { id, ...data }) =>
     prisma.expense.update({ where: { id }, data, include: { category: true } })
   )
 
-  ipcMain.handle('expenses:delete', (_, id: number) =>
+  ipcHandle('expenses:delete', (_, id: number) =>
     prisma.expense.delete({ where: { id } })
   )
 
   // ─── CHART OF ACCOUNTS ────────────────────────────────────────
-  ipcMain.handle('accounts:getAll', () =>
+  ipcHandle('accounts:getAll', () =>
     prisma.account.findMany({ orderBy: { code: 'asc' } })
   )
 
-  ipcMain.handle('accounts:create', (_, data) =>
+  ipcHandle('accounts:create', (_, data) =>
     prisma.account.create({ data })
   )
 
-  ipcMain.handle('accounts:update', (_, { id, ...data }) =>
+  ipcHandle('accounts:update', (_, { id, ...data }) =>
     prisma.account.update({ where: { id }, data })
   )
 
-  ipcMain.handle('accounts:delete', async (_, id: number) => {
+  ipcHandle('accounts:delete', async (_, id: number) => {
     const hasChildren = await prisma.account.count({ where: { parentId: id } })
     if (hasChildren) throw new Error('لا يمكن حذف حساب له حسابات فرعية')
     const hasLines = await prisma.journalEntryLine.count({ where: { accountId: id } })
@@ -1570,7 +1644,7 @@ function setupIpcHandlers() {
     return prisma.account.delete({ where: { id } })
   })
 
-  ipcMain.handle('accounts:getNextCode', async (_, parentId?: number) => {
+  ipcHandle('accounts:getNextCode', async (_, parentId?: number) => {
     const parent = parentId ? await prisma.account.findUnique({ where: { id: parentId } }) : null
     const parentCode = parent?.code ?? ''
     const siblings = await prisma.account.findMany({
@@ -1585,7 +1659,7 @@ function setupIpcHandlers() {
     return parentCode + String(max + 1)
   })
 
-  ipcMain.handle('accounts:seedDefault', async (_, force = false) => {
+  ipcHandle('accounts:seedDefault', async (_, force = false) => {
     const existing = await prisma.account.count()
     if (existing > 0 && !force) return { skipped: true }
     if (force) {
@@ -1771,7 +1845,7 @@ function setupIpcHandlers() {
   }
 
   // ─── JOURNAL ENTRIES ──────────────────────────────────────────
-  ipcMain.handle('journalEntries:getAll', (_, { from, to, status }: any = {}) => {
+  ipcHandle('journalEntries:getAll', (_, { from, to, status }: any = {}) => {
     const where: any = {}
     if (status) where.status = status
     if (from) { const d = new Date(from); d.setUTCHours(0, 0, 0, 0); where.date = { ...where.date, gte: d } }
@@ -1784,7 +1858,7 @@ function setupIpcHandlers() {
     })
   })
 
-  ipcMain.handle('journalEntries:create', async (_, { date, description, reference, lines, post = false }) => {
+  ipcHandle('journalEntries:create', async (_, { date, description, reference, lines, post = false }) => {
     const totalDebit  = lines.reduce((s: number, l: any) => s + (l.debit ?? 0), 0)
     const totalCredit = lines.reduce((s: number, l: any) => s + (l.credit ?? 0), 0)
     if (Math.abs(totalDebit - totalCredit) > 0.01)
@@ -1806,7 +1880,7 @@ function setupIpcHandlers() {
     })
   })
 
-  ipcMain.handle('journalEntries:post', async (_, id: number) => {
+  ipcHandle('journalEntries:post', async (_, id: number) => {
     const entry = await prisma.journalEntry.findUnique({
       where: { id },
       include: { lines: true },
@@ -1825,14 +1899,14 @@ function setupIpcHandlers() {
     return prisma.journalEntry.findUnique({ where: { id }, include: { lines: { include: { account: true } } } })
   })
 
-  ipcMain.handle('journalEntries:delete', async (_, id: number) => {
+  ipcHandle('journalEntries:delete', async (_, id: number) => {
     const entry = await prisma.journalEntry.findUnique({ where: { id } })
     if (!entry) throw new Error('القيد غير موجود')
     if (entry.status === 'posted') throw new Error('لا يمكن حذف قيد مرحل — استخدم عكس القيد')
     return prisma.journalEntry.delete({ where: { id } })
   })
 
-  ipcMain.handle('journalEntries:reverse', async (_, id: number) => {
+  ipcHandle('journalEntries:reverse', async (_, id: number) => {
     const entry = await prisma.journalEntry.findUnique({
       where: { id },
       include: { lines: true },
@@ -1859,7 +1933,7 @@ function setupIpcHandlers() {
     })
   })
 
-  ipcMain.handle('journalEntries:trialBalance', async (_, { from, to }: any = {}) => {
+  ipcHandle('journalEntries:trialBalance', async (_, { from, to }: any = {}) => {
     const netOf = (acc: any, debit: number, credit: number) =>
       acc.normalBalance === 'debit' ? debit - credit : credit - debit
 
@@ -1924,7 +1998,7 @@ function setupIpcHandlers() {
     return { rows, totals }
   })
 
-  ipcMain.handle('journalEntries:ledger', async (_, { accountId, from, to }: any) => {
+  ipcHandle('journalEntries:ledger', async (_, { accountId, from, to }: any) => {
     const where: any = { accountId, entry: { status: 'posted' } }
     if (from) where.entry = { ...where.entry, date: { ...((where.entry as any).date ?? {}), gte: new Date(from) } }
     if (to)   { const d = new Date(to); d.setUTCDate(d.getUTCDate() + 1); where.entry = { ...where.entry, date: { ...((where.entry as any).date ?? {}), lt: d } } }
@@ -1939,7 +2013,7 @@ function setupIpcHandlers() {
   // missing one — covers records created before the chart of accounts was
   // seeded, or any case where auto-posting failed at the time. Safe to run
   // repeatedly: only ever touches sources with zero existing journal entries.
-  ipcMain.handle('journalEntries:backfillMissing', async () => {
+  ipcHandle('journalEntries:backfillMissing', async () => {
     await ensureStandardAccounts()
     const result = { purchases: 0, sales: 0, expenses: 0, errors: [] as string[] }
 
@@ -1976,7 +2050,7 @@ function setupIpcHandlers() {
   })
 
   // ─── BANK ACCOUNTS ────────────────────────────────────────────
-  ipcMain.handle('bankAccounts:getAll', async () => {
+  ipcHandle('bankAccounts:getAll', async () => {
     const accounts = await prisma.bankAccount.findMany({
       include: { account: true },
       orderBy: { name: 'asc' },
@@ -2005,22 +2079,22 @@ function setupIpcHandlers() {
     }))
   })
 
-  ipcMain.handle('bankAccounts:create', (_, data) =>
+  ipcHandle('bankAccounts:create', (_, data) =>
     prisma.bankAccount.create({ data, include: { account: true } })
   )
 
-  ipcMain.handle('bankAccounts:update', (_, { id, ...data }) =>
+  ipcHandle('bankAccounts:update', (_, { id, ...data }) =>
     prisma.bankAccount.update({ where: { id }, data, include: { account: true } })
   )
 
-  ipcMain.handle('bankAccounts:delete', async (_, id: number) => {
+  ipcHandle('bankAccounts:delete', async (_, id: number) => {
     const txCount = await prisma.bankTransaction.count({ where: { bankAccountId: id } })
     if (txCount > 0) throw new Error('لا يمكن حذف حساب له معاملات')
     return prisma.bankAccount.delete({ where: { id } })
   })
 
   // ─── BANK TRANSACTIONS ────────────────────────────────────────
-  ipcMain.handle('bankTransactions:getAll', (_, { bankAccountId, from, to }: any = {}) => {
+  ipcHandle('bankTransactions:getAll', (_, { bankAccountId, from, to }: any = {}) => {
     const where: any = {}
     if (bankAccountId) where.bankAccountId = bankAccountId
     if (from) { const d = new Date(from); d.setUTCHours(0, 0, 0, 0); where.date = { ...where.date, gte: d } }
@@ -2086,14 +2160,14 @@ function setupIpcHandlers() {
     })
   }
 
-  ipcMain.handle('bankTransactions:create', (_, { bankAccountId, type, amount, description, referenceNumber, date, contraAccountId }: any) =>
+  ipcHandle('bankTransactions:create', (_, { bankAccountId, type, amount, description, referenceNumber, date, contraAccountId }: any) =>
     createBankTransactionRecord({
       bankAccountId, type, amount, description, referenceNumber, contraAccountId,
       date: date ? new Date(date) : undefined,
     })
   )
 
-  ipcMain.handle('bankTransactions:delete', async (_, id: number) =>
+  ipcHandle('bankTransactions:delete', async (_, id: number) =>
     prisma.$transaction(async (tx) => {
       const transaction = await tx.bankTransaction.findUnique({ where: { id } })
       if (!transaction) throw new Error('المعاملة غير موجودة')
@@ -2124,7 +2198,7 @@ function setupIpcHandlers() {
     return -1
   }
 
-  ipcMain.handle('bankStatements:parseFile', async () => {
+  ipcHandle('bankStatements:parseFile', async () => {
     const result = await dialog.showOpenDialog(mainWindow!, {
       properties: ['openFile'],
       filters: [{ name: 'Excel/CSV', extensions: ['xlsx', 'xls', 'csv'] }],
@@ -2163,7 +2237,7 @@ function setupIpcHandlers() {
     return { rows: parsed, fileName: path.basename(result.filePaths[0]) }
   })
 
-  ipcMain.handle('bankStatements:import', async (_, { bankAccountId, rows }: any) => {
+  ipcHandle('bankStatements:import', async (_, { bankAccountId, rows }: any) => {
     const batch = `IMP-${Date.now()}`
     let imported = 0, skipped = 0
     for (const r of rows) {
@@ -2188,7 +2262,7 @@ function setupIpcHandlers() {
     return { imported, skipped }
   })
 
-  ipcMain.handle('bankStatements:getAll', (_, { bankAccountId }: any = {}) =>
+  ipcHandle('bankStatements:getAll', (_, { bankAccountId }: any = {}) =>
     prisma.bankStatementLine.findMany({
       where: bankAccountId ? { bankAccountId } : {},
       orderBy: { date: 'desc' },
@@ -2196,21 +2270,21 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('bankStatements:ignore', (_, id: number) =>
+  ipcHandle('bankStatements:ignore', (_, id: number) =>
     prisma.bankStatementLine.update({ where: { id }, data: { status: 'ignored' } })
   )
 
-  ipcMain.handle('bankStatements:unmatch', async (_, id: number) => {
+  ipcHandle('bankStatements:unmatch', async (_, id: number) => {
     const line = await prisma.bankStatementLine.findUnique({ where: { id } })
     if (!line) throw new Error('السطر غير موجود')
     return prisma.bankStatementLine.update({ where: { id }, data: { status: 'unmatched', matchedTransactionId: null } })
   })
 
-  ipcMain.handle('bankStatements:delete', (_, id: number) =>
+  ipcHandle('bankStatements:delete', (_, id: number) =>
     prisma.bankStatementLine.delete({ where: { id } })
   )
 
-  ipcMain.handle('bankStatements:match', async (_, { lineId, transactionId }: any) => {
+  ipcHandle('bankStatements:match', async (_, { lineId, transactionId }: any) => {
     const line = await prisma.bankStatementLine.findUnique({ where: { id: lineId } })
     if (!line) throw new Error('السطر غير موجود')
     const tx = await prisma.bankTransaction.findUnique({ where: { id: transactionId } })
@@ -2221,7 +2295,7 @@ function setupIpcHandlers() {
     })
   })
 
-  ipcMain.handle('bankStatements:createFromLine', async (_, { lineId, contraAccountId, description }: any) => {
+  ipcHandle('bankStatements:createFromLine', async (_, { lineId, contraAccountId, description }: any) => {
     const line = await prisma.bankStatementLine.findUnique({ where: { id: lineId } })
     if (!line) throw new Error('السطر غير موجود')
     const tx = await createBankTransactionRecord({
@@ -2240,7 +2314,7 @@ function setupIpcHandlers() {
     return tx
   })
 
-  ipcMain.handle('bankStatements:applyRules', async (_, { bankAccountId }: any) => {
+  ipcHandle('bankStatements:applyRules', async (_, { bankAccountId }: any) => {
     const rules = await prisma.bankRule.findMany({
       where: { isActive: true, OR: [{ bankAccountId }, { bankAccountId: null }] },
       orderBy: { id: 'asc' },
@@ -2277,24 +2351,24 @@ function setupIpcHandlers() {
   })
 
   // ─── BANK RULES ─────────────────────────────────────────────
-  ipcMain.handle('bankRules:getAll', () =>
+  ipcHandle('bankRules:getAll', () =>
     prisma.bankRule.findMany({ orderBy: { id: 'desc' } })
   )
 
-  ipcMain.handle('bankRules:create', (_, data) =>
+  ipcHandle('bankRules:create', (_, data) =>
     prisma.bankRule.create({ data })
   )
 
-  ipcMain.handle('bankRules:update', (_, { id, ...data }) =>
+  ipcHandle('bankRules:update', (_, { id, ...data }) =>
     prisma.bankRule.update({ where: { id }, data })
   )
 
-  ipcMain.handle('bankRules:delete', (_, id: number) =>
+  ipcHandle('bankRules:delete', (_, id: number) =>
     prisma.bankRule.delete({ where: { id } })
   )
 
   // ─── FINANCIAL REPORTS ────────────────────────────────────────
-  ipcMain.handle('reports:financial', async (_, { from, to }: { from?: string; to?: string } = {}) => {
+  ipcHandle('reports:financial', async (_, { from, to }: { from?: string; to?: string } = {}) => {
     const dateFilter: any = {}
     if (from) { const d = new Date(from); d.setUTCHours(0, 0, 0, 0); dateFilter.gte = d }
     if (to)   { const d = new Date(to);   d.setUTCDate(d.getUTCDate() + 1); d.setUTCHours(0, 0, 0, 0); dateFilter.lte = d }
@@ -2389,7 +2463,7 @@ function setupIpcHandlers() {
 
   // ─── EXTENDED REPORTS ─────────────────────────────────────────
 
-  ipcMain.handle('reports:customerStatement', async (_, { customerId, from, to }: any = {}) => {
+  ipcHandle('reports:customerStatement', async (_, { customerId, from, to }: any = {}) => {
     const where: any = { status: 'completed' }
     if (customerId) where.customerId = Number(customerId)
     if (from) { const d = new Date(from); d.setUTCHours(0,0,0,0); where.createdAt = { ...where.createdAt, gte: d } }
@@ -2402,7 +2476,7 @@ function setupIpcHandlers() {
     return { rows, total: orders.reduce((s, o) => s + o.total, 0), count: orders.length }
   })
 
-  ipcMain.handle('reports:supplierStatement', async (_, { supplierId, from, to }: any = {}) => {
+  ipcHandle('reports:supplierStatement', async (_, { supplierId, from, to }: any = {}) => {
     const where: any = { status: 'confirmed' }
     if (supplierId) where.supplierId = Number(supplierId)
     if (from) { const d = new Date(from); d.setUTCHours(0,0,0,0); where.invoiceDate = { ...where.invoiceDate, gte: d } }
@@ -2415,7 +2489,7 @@ function setupIpcHandlers() {
     return { rows, total: invoices.reduce((s, i) => s + i.total, 0), count: invoices.length }
   })
 
-  ipcMain.handle('reports:vatDetails', async (_, { from, to }: any = {}) => {
+  ipcHandle('reports:vatDetails', async (_, { from, to }: any = {}) => {
     const df: any = {}
     if (from) { const d = new Date(from); d.setUTCHours(0,0,0,0); df.gte = d }
     if (to)   { const d = new Date(to); d.setUTCDate(d.getUTCDate()+1); d.setUTCHours(0,0,0,0); df.lte = d }
@@ -2442,7 +2516,7 @@ function setupIpcHandlers() {
     }
   })
 
-  ipcMain.handle('reports:cashFlow', async (_, { from, to }: any = {}) => {
+  ipcHandle('reports:cashFlow', async (_, { from, to }: any = {}) => {
     const df: any = {}
     if (from) { const d = new Date(from); d.setUTCHours(0,0,0,0); df.gte = d }
     if (to)   { const d = new Date(to); d.setUTCDate(d.getUTCDate()+1); d.setUTCHours(0,0,0,0); df.lte = d }
@@ -2463,7 +2537,7 @@ function setupIpcHandlers() {
     return { transactions: txs, byMonth, totals: { in: totalIn, out: totalOut, net: totalIn - totalOut } }
   })
 
-  ipcMain.handle('reports:arAging', async (_, { asOf }: any = {}) => {
+  ipcHandle('reports:arAging', async (_, { asOf }: any = {}) => {
     const cutoff = asOf ? new Date(asOf) : new Date()
     const customers = await prisma.customer.findMany({
       include: { orders: { where: { status: 'completed' }, orderBy: { createdAt: 'desc' } } },
@@ -2476,7 +2550,7 @@ function setupIpcHandlers() {
     }).sort((a, b) => b.total - a.total)
   })
 
-  ipcMain.handle('reports:apAging', async (_, { asOf }: any = {}) => {
+  ipcHandle('reports:apAging', async (_, { asOf }: any = {}) => {
     const cutoff = asOf ? new Date(asOf) : new Date()
     const invoices = await prisma.purchaseInvoice.findMany({
       where: { status: 'confirmed' }, include: { supplier: true }, orderBy: { invoiceDate: 'asc' },
@@ -2497,7 +2571,7 @@ function setupIpcHandlers() {
     return Array.from(map.values()).sort((a, b) => b.total - a.total)
   })
 
-  ipcMain.handle('reports:executiveSummary', async (_, { from, to }: any = {}) => {
+  ipcHandle('reports:executiveSummary', async (_, { from, to }: any = {}) => {
     const df: any = {}
     if (from) { const d = new Date(from); d.setUTCHours(0,0,0,0); df.gte = d }
     if (to)   { const d = new Date(to); d.setUTCDate(d.getUTCDate()+1); d.setUTCHours(0,0,0,0); df.lte = d }
@@ -2531,7 +2605,7 @@ function setupIpcHandlers() {
     }
   })
 
-  ipcMain.handle('reports:inventoryExtended', async (_, { categoryId }: any = {}) => {
+  ipcHandle('reports:inventoryExtended', async (_, { categoryId }: any = {}) => {
     const [products, categories] = await Promise.all([
       prisma.product.findMany({
         where: { isActive: true, ...(categoryId ? { categoryId: Number(categoryId) } : {}) },
@@ -2555,7 +2629,7 @@ function setupIpcHandlers() {
     }
   })
 
-  ipcMain.handle('reports:banksSummary', async (_, { from, to }: any = {}) => {
+  ipcHandle('reports:banksSummary', async (_, { from, to }: any = {}) => {
     const df: any = {}
     if (from) { const d = new Date(from); d.setUTCHours(0,0,0,0); df.gte = d }
     if (to)   { const d = new Date(to); d.setUTCDate(d.getUTCDate()+1); d.setUTCHours(0,0,0,0); df.lte = d }
@@ -2580,14 +2654,14 @@ function setupIpcHandlers() {
   })
 
   // ─── BACKUP ────────────────────────────────────────────────────
-  ipcMain.handle('backup:selectFolder', async () => {
+  ipcHandle('backup:selectFolder', async () => {
     const result = await dialog.showOpenDialog(mainWindow!, {
       properties: ['openDirectory', 'createDirectory'],
     })
     return result.canceled ? null : result.filePaths[0]
   })
 
-  ipcMain.handle('backup:create', async () => {
+  ipcHandle('backup:create', async () => {
     const { copyFile } = await import('node:fs/promises')
     const result = await dialog.showSaveDialog(mainWindow!, {
       defaultPath: `umarket-backup-${new Date().toISOString().slice(0, 10)}.db`,
@@ -2599,7 +2673,7 @@ function setupIpcHandlers() {
   })
 
   // ─── SYSTEM ─────────────────────────────────────────────────────
-  ipcMain.handle('system:clearAllData', async (_, payload: { sections: string[]; userId: number; pin: string }) => {
+  ipcHandle('system:clearAllData', async (_, payload: { sections: string[]; userId: number; pin: string }) => {
     const { sections, userId, pin } = payload || {}
     if (!Array.isArray(sections) || sections.length === 0) {
       throw new Error('اختر قسمًا واحدًا على الأقل')
@@ -2766,7 +2840,7 @@ function setupIpcHandlers() {
     return { ok: true }
   })
 
-  ipcMain.handle('system:autoBackupStatus', async () => {
+  ipcHandle('system:autoBackupStatus', async () => {
     const rows = await prisma.setting.findMany({
       where: { key: { in: ['autoBackupEnabled', 'autoBackupPath', 'autoBackupInterval', 'autoBackupLastRun'] } },
     })
