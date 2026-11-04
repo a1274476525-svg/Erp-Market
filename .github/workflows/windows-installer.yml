@@ -1,0 +1,39 @@
+name: Windows installer
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-installer:
+    runs-on: windows-latest
+    env:
+      DATABASE_URL: file:./prisma/umarket.db
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Generate Prisma client
+        run: npx prisma generate
+      - name: Create clean SQLite template
+        run: npx prisma db push
+      - name: Build Windows installer
+        run: npm run dist:win
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: U-Market-Windows-Installer
+          path: release/*.exe
+          if-no-files-found: error
+          retention-days: 30
