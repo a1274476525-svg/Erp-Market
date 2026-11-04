@@ -20,6 +20,7 @@ const prisma = new PrismaClient()
 
 let mainWindow: BrowserWindow | null = null
 const clearPinFailures = new Map<number, { count: number; lockedUntil: number }>()
+const loginPinFailures = new Map<number, { count: number; lockedUntil: number }>()
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -1234,11 +1235,22 @@ function setupIpcHandlers() {
 
   ipcMain.handle('auth:login', async (_, userId: number, pin: string) => {
     if (!Number.isInteger(userId) || typeof pin !== 'string') return null
+    const now = Date.now()
+    const failure = loginPinFailures.get(userId)
+    if (failure && failure.lockedUntil > now) return null
     const user = await prisma.user.findFirst({
       where: { id: userId, pin, isActive: true },
       select: { id: true, name: true, role: true, isActive: true, createdAt: true },
     })
-    if (!user) return null
+    if (!user) {
+      const count = (failure?.count ?? 0) + 1
+      loginPinFailures.set(userId, {
+        count: count >= 5 ? 0 : count,
+        lockedUntil: count >= 5 ? now + 60_000 : 0,
+      })
+      return null
+    }
+    loginPinFailures.delete(userId)
     const roleData = await resolveRole(user.role)
     if (!roleData) return null
     return { ...user, roleData }
