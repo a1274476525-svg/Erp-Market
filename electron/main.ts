@@ -1,7 +1,7 @@
 import { app, BrowserWindow, ipcMain, dialog } from 'electron'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { PrismaClient } from '@prisma/client'
+import { Prisma, PrismaClient } from '@prisma/client'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname  = path.dirname(__filename)
@@ -228,6 +228,54 @@ const STANDARD_ACCOUNTS: { code: string; name: string; type: string; nb: string;
 ]
 
 function setupIpcHandlers() {
+  async function getDefaultWarehouse(tx: Prisma.TransactionClient) {
+    let branch = await tx.branch.findFirst({ where: { isDefault: true } })
+    if (!branch) branch = await tx.branch.findFirst({ orderBy: { id: 'asc' } })
+    if (!branch) branch = await tx.branch.create({ data: { name: 'الفرع الرئيسي', isDefault: true } })
+
+    let warehouse = await tx.warehouse.findFirst({
+      where: { branchId: branch.id, isDefault: true },
+    })
+    if (!warehouse) {
+      warehouse = await tx.warehouse.create({
+        data: { name: 'المخزن الرئيسي', branchId: branch.id, isDefault: true },
+      })
+    }
+    return warehouse
+  }
+
+  async function refreshProductStock(tx: Prisma.TransactionClient, productId: number) {
+    const total = await tx.warehouseStock.aggregate({
+      where: { productId },
+      _sum: { quantity: true },
+    })
+    const currentStock = total._sum.quantity ?? 0
+    await tx.product.update({ where: { id: productId }, data: { currentStock } })
+    return currentStock
+  }
+
+  async function changeWarehouseStock(
+    tx: Prisma.TransactionClient,
+    warehouseId: number,
+    productId: number,
+    delta: number,
+  ) {
+    if (!Number.isFinite(delta) || delta === 0) throw new Error('تغير المخزون غير صالح')
+    if (delta < 0) {
+      const changed = await tx.warehouseStock.updateMany({
+        where: { warehouseId, productId, quantity: { gte: -delta } },
+        data: { quantity: { decrement: -delta } },
+      })
+      if (changed.count !== 1) throw new Error('المخزون غير كافٍ في المخزن المحدد')
+    } else {
+      await tx.warehouseStock.upsert({
+        where: { warehouseId_productId: { warehouseId, productId } },
+        update: { quantity: { increment: delta } },
+        create: { warehouseId, productId, quantity: delta },
+      })
+    }
+    return refreshProductStock(tx, productId)
+  }
 
   // ─── PRODUCTS ──────────────────────────────────────────────────
   ipcMain.handle('products:getAll', (_, includeInactive = false) =>
@@ -280,19 +328,27 @@ function setupIpcHandlers() {
     return `PRD-${String(num).padStart(4, '0')}`
   }
 
-  ipcMain.handle('products:create', async (_, data) => {
-    const sku     = data.sku || await nextSku()
-    const product = await prisma.product.create({ data: { ...data, sku } })
-    const warehouses = await prisma.warehouse.findMany({ select: { id: true } })
-    for (const wh of warehouses) {
-      await prisma.warehouseStock.upsert({
-        where:  { warehouseId_productId: { warehouseId: wh.id, productId: product.id } },
-        update: {},
-        create: { warehouseId: wh.id, productId: product.id, quantity: 0 },
-      })
-    }
-    return product
-  })
+  ipcMain.handle('products:create', async (_, data) =>
+    prisma.$transaction(async (tx) => {
+      const sku = data.sku || await nextSku()
+      const initialStock = Number(data.currentStock ?? 0)
+      if (!Number.isFinite(initialStock) || initialStock < 0) throw new Error('الرصيد الافتتاحي غير صالح')
+      const product = await tx.product.create({ data: { ...data, sku, currentStock: 0 } })
+      const defaultWarehouse = await getDefaultWarehouse(tx)
+      const warehouses = await tx.warehouse.findMany({ select: { id: true } })
+      for (const wh of warehouses) {
+        await tx.warehouseStock.create({
+          data: {
+            warehouseId: wh.id,
+            productId: product.id,
+            quantity: wh.id === defaultWarehouse.id ? initialStock : 0,
+          },
+        })
+      }
+      await tx.product.update({ where: { id: product.id }, data: { currentStock: initialStock } })
+      return { ...product, currentStock: initialStock }
+    })
+  )
 
   ipcMain.handle('products:update', async (_, { id, ...data }) => {
     const old = await prisma.product.findUnique({ where: { id } })
@@ -417,16 +473,19 @@ function setupIpcHandlers() {
   )
 
   ipcMain.handle('invoices:create', async (_, { items, ...header }) => {
+    if (!Array.isArray(items) || items.length === 0) throw new Error('أضف أصناف فاتورة الشراء')
     const invoice = await prisma.$transaction(async (tx) => {
+      const warehouse = await getDefaultWarehouse(tx)
       const inv = await tx.purchaseInvoice.create({
         data: { ...header, status: 'confirmed', items: { create: items } },
         include: { items: true },
       })
       for (const item of inv.items) {
-        await tx.product.update({
-          where: { id: item.productId },
-          data: { currentStock: { increment: item.quantity }, costPrice: item.unitPrice },
-        })
+        if (!Number.isFinite(item.quantity) || item.quantity <= 0 || !Number.isFinite(item.unitPrice) || item.unitPrice < 0) {
+          throw new Error('بيانات صنف في فاتورة الشراء غير صالحة')
+        }
+        await changeWarehouseStock(tx, warehouse.id, item.productId, item.quantity)
+        await tx.product.update({ where: { id: item.productId }, data: { costPrice: item.unitPrice } })
         await tx.stockMovement.create({
           data: { productId: item.productId, quantity: item.quantity, type: 'purchase', referenceId: inv.id },
         })
@@ -475,12 +534,11 @@ function setupIpcHandlers() {
         include: { items: true },
       })
       if (!inv) throw new Error('الفاتورة غير موجودة')
+      const warehouse = await getDefaultWarehouse(tx)
       for (const item of inv.items) {
         if (!Number.isFinite(item.quantity) || item.quantity <= 0) throw new Error('كمية شراء غير صالحة')
-        await tx.product.update({
-          where: { id: item.productId },
-          data: { currentStock: { increment: item.quantity }, costPrice: item.unitPrice },
-        })
+        await changeWarehouseStock(tx, warehouse.id, item.productId, item.quantity)
+        await tx.product.update({ where: { id: item.productId }, data: { costPrice: item.unitPrice } })
         await tx.stockMovement.create({
           data: { productId: item.productId, quantity: item.quantity, type: 'purchase', referenceId: id },
         })
@@ -580,12 +638,11 @@ function setupIpcHandlers() {
         },
         include: { items: true },
       })
+      const warehouse = await getDefaultWarehouse(tx)
       for (const item of o.items) {
-        const updated = await tx.product.updateMany({
-          where: { id: item.productId, isActive: true, currentStock: { gte: item.quantity } },
-          data: { currentStock: { decrement: item.quantity } },
-        })
-        if (updated.count !== 1) throw new Error('المخزون غير كافٍ أو المنتج غير نشط')
+        const product = await tx.product.findUnique({ where: { id: item.productId }, select: { isActive: true } })
+        if (!product?.isActive) throw new Error('المنتج غير نشط')
+        await changeWarehouseStock(tx, warehouse.id, item.productId, -item.quantity)
         await tx.stockMovement.create({
           data: { productId: item.productId, quantity: -item.quantity, type: 'sale', referenceId: o.id },
         })
@@ -629,11 +686,9 @@ function setupIpcHandlers() {
         data: { status: 'voided' },
         include: { items: true },
       })
+      const warehouse = await getDefaultWarehouse(tx)
       for (const item of o.items) {
-        await tx.product.update({
-          where: { id: item.productId },
-          data: { currentStock: { increment: item.quantity } },
-        })
+        await changeWarehouseStock(tx, warehouse.id, item.productId, item.quantity)
         await tx.stockMovement.create({
           data: { productId: item.productId, quantity: item.quantity, type: 'return', referenceId: o.id, note: `إلغاء ${o.orderNumber}` },
         })
@@ -713,11 +768,9 @@ function setupIpcHandlers() {
         data: { orderId, reason, total, items: { create: normalizedItems } },
         include: { items: true },
       })
+      const warehouse = await getDefaultWarehouse(tx)
       for (const item of r.items) {
-        await tx.product.update({
-          where: { id: item.productId },
-          data: { currentStock: { increment: item.quantity } },
-        })
+        await changeWarehouseStock(tx, warehouse.id, item.productId, item.quantity)
         await tx.stockMovement.create({
           data: { productId: item.productId, quantity: item.quantity, type: 'return', referenceId: r.id },
         })
@@ -789,23 +842,23 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('stock:adjust', async (_, { productId, quantity, note }: { productId: number; quantity: number; note?: string }) => {
-    if (!quantity || quantity === 0) throw new Error('الكمية يجب أن تكون غير صفرية')
-    await prisma.product.update({ where: { id: productId }, data: { currentStock: { increment: quantity } } })
-    await prisma.stockMovement.create({
-      data: { productId, quantity, type: 'adjust', note },
+  ipcMain.handle('stock:adjust', async (_, { productId, quantity, note }: { productId: number; quantity: number; note?: string }) =>
+    prisma.$transaction(async (tx) => {
+      if (!Number.isFinite(quantity) || quantity === 0) throw new Error('الكمية يجب أن تكون رقمًا غير صفري')
+      const warehouse = await getDefaultWarehouse(tx)
+      await changeWarehouseStock(tx, warehouse.id, productId, quantity)
+      return tx.stockMovement.create({ data: { productId, quantity, type: 'adjust', note } })
     })
-  })
+  )
 
-  ipcMain.handle('stock:waste', async (_, { productId, quantity, note }: { productId: number; quantity: number; note?: string }) => {
-    await prisma.product.update({
-      where: { id: productId },
-      data: { currentStock: { decrement: quantity } },
+  ipcMain.handle('stock:waste', async (_, { productId, quantity, note }: { productId: number; quantity: number; note?: string }) =>
+    prisma.$transaction(async (tx) => {
+      if (!Number.isFinite(quantity) || quantity <= 0) throw new Error('كمية الهالك يجب أن تكون أكبر من صفر')
+      const warehouse = await getDefaultWarehouse(tx)
+      await changeWarehouseStock(tx, warehouse.id, productId, -quantity)
+      return tx.stockMovement.create({ data: { productId, quantity: -quantity, type: 'waste', note } })
     })
-    await prisma.stockMovement.create({
-      data: { productId, quantity: -quantity, type: 'waste', note },
-    })
-  })
+  )
 
   ipcMain.handle('stock:convertUnit', async (_, { productId, fromUnit, toUnit, quantity, factor, userId, note }: { productId: number; fromUnit: string; toUnit: string; quantity: number; factor: number; userId?: number; note?: string }) => {
     // Conversion between packaging units does not change total base stock;
@@ -832,27 +885,49 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('branches:create', async (_, data) => {
-    const branch = await prisma.branch.create({ data })
-    await prisma.warehouse.create({ data: { name: 'المخزن الرئيسي', branchId: branch.id, isDefault: true } })
-    return branch
-  })
+  ipcMain.handle('branches:create', async (_, data) =>
+    prisma.$transaction(async (tx) => {
+      const branch = await tx.branch.create({ data: { ...data, isDefault: false } })
+      await tx.warehouse.create({ data: { name: 'المخزن الرئيسي', branchId: branch.id, isDefault: true } })
+      return branch
+    })
+  )
 
   ipcMain.handle('branches:update', (_, { id, ...data }) =>
     prisma.branch.update({ where: { id }, data })
   )
 
-  ipcMain.handle('branches:delete', (_, id: number) =>
-    prisma.branch.delete({ where: { id } })
-  )
+  ipcMain.handle('branches:delete', async (_, id: number) => {
+    const branch = await prisma.branch.findUnique({ where: { id }, include: { warehouses: true } })
+    if (!branch) throw new Error('الفرع غير موجود')
+    if (branch.isDefault) throw new Error('لا يمكن حذف الفرع الرئيسي')
+    if (branch.warehouses.length > 0) throw new Error('احذف أو انقل مخازن الفرع أولاً')
+    return prisma.branch.delete({ where: { id } })
+  })
 
   // ─── WAREHOUSES ────────────────────────────────────────────────
-  ipcMain.handle('warehouses:init', async () => {
-    const count = await prisma.branch.count()
-    if (count > 0) return
-    const branch = await prisma.branch.create({ data: { name: 'الفرع الرئيسي', isDefault: true } })
-    await prisma.warehouse.create({ data: { name: 'المخزن الرئيسي', branchId: branch.id, isDefault: true } })
-  })
+  ipcMain.handle('warehouses:init', async () =>
+    prisma.$transaction(async (tx) => {
+      const warehouse = await getDefaultWarehouse(tx)
+      const products = await tx.product.findMany({ select: { id: true, currentStock: true } })
+      for (const product of products) {
+        const total = await tx.warehouseStock.aggregate({
+          where: { productId: product.id },
+          _sum: { quantity: true },
+        })
+        // One-time compatibility bridge for databases that only had Product.currentStock.
+        // Once any warehouse has stock, warehouse balances become the source of truth.
+        if ((total._sum.quantity ?? 0) === 0 && product.currentStock > 0) {
+          await tx.warehouseStock.upsert({
+            where: { warehouseId_productId: { warehouseId: warehouse.id, productId: product.id } },
+            update: { quantity: product.currentStock },
+            create: { warehouseId: warehouse.id, productId: product.id, quantity: product.currentStock },
+          })
+        }
+        await refreshProductStock(tx, product.id)
+      }
+    })
+  )
 
   ipcMain.handle('warehouses:getAll', () =>
     prisma.warehouse.findMany({
@@ -861,38 +936,74 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcMain.handle('warehouses:create', (_, data) =>
-    prisma.warehouse.create({ data })
+  ipcMain.handle('warehouses:create', async (_, data) =>
+    prisma.$transaction(async (tx) => {
+      const warehouse = await tx.warehouse.create({ data: { ...data, isDefault: false } })
+      const products = await tx.product.findMany({ select: { id: true } })
+      if (products.length) {
+        await tx.warehouseStock.createMany({
+          data: products.map(product => ({ warehouseId: warehouse.id, productId: product.id, quantity: 0 })),
+          skipDuplicates: true,
+        })
+      }
+      return warehouse
+    })
   )
 
   ipcMain.handle('warehouses:update', (_, { id, ...data }) =>
     prisma.warehouse.update({ where: { id }, data })
   )
 
-  ipcMain.handle('warehouses:delete', (_, id: number) =>
-    prisma.warehouse.delete({ where: { id } })
+  ipcMain.handle('warehouses:delete', async (_, id: number) =>
+    prisma.$transaction(async (tx) => {
+      const warehouse = await tx.warehouse.findUnique({
+        where: { id },
+        include: { stocks: true, branch: true },
+      })
+      if (!warehouse) throw new Error('المخزن غير موجود')
+      if (warehouse.isDefault) throw new Error('لا يمكن حذف المخزن الافتراضي للفرع')
+      if (warehouse.stocks.some(stock => Math.abs(stock.quantity) > 0.000001)) {
+        throw new Error('لا يمكن حذف مخزن يحتوي على رصيد. انقل المخزون أولاً')
+      }
+      const [fromRequests, toRequests, fromTransfers, toTransfers] = await Promise.all([
+        tx.transferRequest.count({ where: { fromWarehouseId: id } }),
+        tx.transferRequest.count({ where: { toWarehouseId: id } }),
+        tx.transfer.count({ where: { fromWarehouseId: id } }),
+        tx.transfer.count({ where: { toWarehouseId: id } }),
+      ])
+      if (fromRequests + toRequests + fromTransfers + toTransfers > 0) {
+        throw new Error('لا يمكن حذف مخزن مرتبط بطلبات أو تحويلات سابقة')
+      }
+      return tx.warehouse.delete({ where: { id } })
+    })
   )
 
-  ipcMain.handle('warehouses:setDefault', async (_, id: number) => {
-    const wh = await prisma.warehouse.findUnique({ where: { id } })
-    if (!wh) return
-    await prisma.warehouse.updateMany({ where: { branchId: wh.branchId }, data: { isDefault: false } })
-    await prisma.warehouse.update({ where: { id }, data: { isDefault: true } })
-  })
-
-  ipcMain.handle('warehouses:syncStock', async (_, warehouseId: number) => {
-    const warehouse = await prisma.warehouse.findUnique({ where: { id: warehouseId }, include: { branch: true } })
-    if (!warehouse) throw new Error('المخزن غير موجود')
-    const products = await prisma.product.findMany()
-    for (const p of products) {
-      await prisma.warehouseStock.upsert({
-        where: { warehouseId_productId: { warehouseId, productId: p.id } },
-        update: {},
-        // Seed the default warehouse from the legacy/global product stock on first sync.
-        create: { warehouseId, productId: p.id, quantity: warehouse.isDefault && warehouse.branch.isDefault ? p.currentStock : 0 },
+  ipcMain.handle('warehouses:setDefault', async (_, id: number) =>
+    prisma.$transaction(async (tx) => {
+      const warehouse = await tx.warehouse.findUnique({ where: { id } })
+      if (!warehouse) throw new Error('المخزن غير موجود')
+      await tx.warehouse.updateMany({
+        where: { branchId: warehouse.branchId },
+        data: { isDefault: false },
       })
-    }
-  })
+      return tx.warehouse.update({ where: { id }, data: { isDefault: true } })
+    })
+  )
+
+  ipcMain.handle('warehouses:syncStock', async (_, warehouseId: number) =>
+    prisma.$transaction(async (tx) => {
+      const warehouse = await tx.warehouse.findUnique({ where: { id: warehouseId } })
+      if (!warehouse) throw new Error('المخزن غير موجود')
+      const products = await tx.product.findMany({ select: { id: true } })
+      if (products.length) {
+        await tx.warehouseStock.createMany({
+          data: products.map(product => ({ warehouseId, productId: product.id, quantity: 0 })),
+          skipDuplicates: true,
+        })
+      }
+      return products.length
+    })
+  )
 
   // ─── TRANSFER REQUESTS ─────────────────────────────────────────
   ipcMain.handle('transferRequests:getAll', () =>
@@ -1048,14 +1159,26 @@ function setupIpcHandlers() {
   })
 
   ipcMain.handle('inventory:addItems', async (_, { inventoryCountId, productIds }: { inventoryCountId: number; productIds: number[] }) => {
-    const products = await prisma.product.findMany({ where: { id: { in: productIds } } })
-    for (const p of products) {
-      await prisma.inventoryCountItem.upsert({
-        where: { inventoryCountId_productId: { inventoryCountId, productId: p.id } } as any,
-        update: {},
-        create: { inventoryCountId, productId: p.id, systemQuantity: p.currentStock, actualQuantity: 0 },
-      })
-    }
+    await prisma.$transaction(async (tx) => {
+      const count = await tx.inventoryCount.findUnique({ where: { id: inventoryCountId } })
+      if (!count || count.status === 'closed') throw new Error('الجرد غير موجود أو مغلق')
+      const warehouse = await getDefaultWarehouse(tx)
+      const products = await tx.product.findMany({ where: { id: { in: productIds } } })
+      for (const product of products) {
+        const stock = await tx.warehouseStock.findUnique({
+          where: { warehouseId_productId: { warehouseId: warehouse.id, productId: product.id } },
+        })
+        await tx.inventoryCountItem.upsert({
+          where: { inventoryCountId_productId: { inventoryCountId, productId: product.id } },
+          update: {},
+          create: {
+            inventoryCountId, productId: product.id,
+            systemQuantity: stock?.quantity ?? 0,
+            actualQuantity: stock?.quantity ?? 0,
+          },
+        })
+      }
+    })
   })
 
   ipcMain.handle('inventory:removeItem', (_, id: number) =>
@@ -1074,12 +1197,18 @@ function setupIpcHandlers() {
       })
       if (!count) throw new Error('الجرد غير موجود')
       if (count.status === 'closed') throw new Error('تم إغلاق هذا الجرد بالفعل')
+      if (count.items.length === 0) throw new Error('لا توجد أصناف في الجرد')
+      const warehouse = await getDefaultWarehouse(tx)
       for (const item of count.items) {
-        const diff = item.actualQuantity - item.systemQuantity
-        await tx.product.update({
-          where: { id: item.productId },
-          data: { currentStock: item.actualQuantity },
+        const current = await tx.warehouseStock.findUnique({
+          where: { warehouseId_productId: { warehouseId: warehouse.id, productId: item.productId } },
         })
+        const currentQuantity = current?.quantity ?? 0
+        const diff = item.actualQuantity - currentQuantity
+        if (!Number.isFinite(item.actualQuantity) || item.actualQuantity < 0) throw new Error('الكمية الفعلية غير صالحة')
+        if (diff !== 0) {
+          await changeWarehouseStock(tx, warehouse.id, item.productId, diff)
+        }
         if (diff !== 0) {
           await tx.stockMovement.create({
             data: { productId: item.productId, quantity: diff, type: 'adjust', note: `جرد #${count.referenceNumber}` },
