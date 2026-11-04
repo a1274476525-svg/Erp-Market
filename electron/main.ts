@@ -2550,6 +2550,8 @@ function setupIpcHandlers() {
       }
 
       if (removeAccounting) {
+        // Bank transactions keep an optional scalar link to their journal entry.
+        await tx.bankTransaction.updateMany({ data: { journalEntryId: null } })
         await tx.journalEntryLine.deleteMany({})
         await tx.journalEntry.deleteMany({})
       }
