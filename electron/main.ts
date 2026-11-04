@@ -944,6 +944,7 @@ function setupIpcHandlers() {
       })
       if (!req) throw new Error('طلب التحويل غير موجود')
       if (req.transfer || req.status === 'transferred') throw new Error('تم تنفيذ طلب التحويل بالفعل')
+      if (req.status !== 'approved') throw new Error('يجب الموافقة على طلب التحويل أولاً')
       if (req.fromWarehouseId === req.toWarehouseId) throw new Error('لا يمكن التحويل إلى نفس المخزن')
       if (req.items.length === 0) throw new Error('طلب التحويل لا يحتوي على أصناف')
 
@@ -1443,8 +1444,14 @@ function setupIpcHandlers() {
 
   // ─── JOURNAL ENTRY HELPERS ────────────────────────────────────
   async function nextJENumber() {
-    const count = await prisma.journalEntry.count()
-    return `JE-${String(count + 1).padStart(5, '0')}`
+    const latest = await prisma.journalEntry.aggregate({ _max: { id: true } })
+    let sequence = (latest._max.id ?? 0) + 1
+    let number = `JE-${String(sequence).padStart(5, '0')}`
+    while (await prisma.journalEntry.findUnique({ where: { number } })) {
+      sequence++
+      number = `JE-${String(sequence).padStart(5, '0')}`
+    }
+    return number
   }
 
   async function findAccByCode(code: string) {
