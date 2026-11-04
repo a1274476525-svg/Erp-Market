@@ -158,7 +158,7 @@ export default function SettingsPage() {
                 inputMode="numeric"
                 maxLength={4}
                 value={clearPassword}
-                onChange={e => { setClearPassword(e.target.value.replace(/\\D/g, '').slice(0, 4)); setClearError('') }}
+                onChange={e => { setClearPassword(e.target.value.replace(/\D/g, '').slice(0, 4)); setClearError('') }}
                 autoComplete="current-password"
                 placeholder="أدخل رقم دخول المدير"
                 disabled={clearing}
@@ -167,13 +167,13 @@ export default function SettingsPage() {
               {clearError && <p role="alert" className="text-sm text-red-600">{clearError}</p>}
             </div>
             <button
-              disabled={clearing || clearSections.length === 0 || !/^\\d{4}$/.test(clearPassword) || !user}
+              disabled={clearing || clearSections.length === 0 || !/^\d{4}$/.test(clearPassword) || !user}
               onClick={async () => {
                 if (clearSections.length === 0) {
                   setClearError('اختر قسمًا واحدًا على الأقل')
                   return
                 }
-                if (!/^\\d{4}$/.test(clearPassword)) {
+                if (!/^\d{4}$/.test(clearPassword)) {
                   setClearError('أدخل رقم دخول المدير المكوّن من 4 أرقام')
                   return
                 }
