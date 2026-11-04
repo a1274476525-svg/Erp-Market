@@ -559,9 +559,15 @@ function setupIpcHandlers() {
 
   // ─── POS ───────────────────────────────────────────────────────
   ipcMain.handle('pos:createOrder', async (_, { items, customerId, ...header }) => {
+    if (!Array.isArray(items) || items.length === 0) throw new Error('أضف صنفًا واحدًا على الأقل')
+    for (const item of items) {
+      if (!Number.isInteger(item.productId) || !Number.isFinite(item.quantity) || item.quantity <= 0) {
+        throw new Error('بيانات صنف غير صالحة')
+      }
+    }
     const order = await prisma.$transaction(async (tx) => {
-      const count = await tx.posOrder.count()
-      const num   = String(count + 1).padStart(6, '0')
+      const maxOrder = await tx.posOrder.aggregate({ _max: { id: true } })
+      const num = String((maxOrder._max.id ?? 0) + 1).padStart(6, '0')
       const o = await tx.posOrder.create({
         data: {
           orderNumber: `ORD-${num}`,
@@ -572,10 +578,11 @@ function setupIpcHandlers() {
         include: { items: true },
       })
       for (const item of o.items) {
-        await tx.product.update({
-          where: { id: item.productId },
+        const updated = await tx.product.updateMany({
+          where: { id: item.productId, isActive: true, currentStock: { gte: item.quantity } },
           data: { currentStock: { decrement: item.quantity } },
         })
+        if (updated.count !== 1) throw new Error('المخزون غير كافٍ أو المنتج غير نشط')
         await tx.stockMovement.create({
           data: { productId: item.productId, quantity: -item.quantity, type: 'sale', referenceId: o.id },
         })
@@ -606,6 +613,14 @@ function setupIpcHandlers() {
 
   ipcMain.handle('pos:voidOrder', async (_, id: number) => {
     const order = await prisma.$transaction(async (tx) => {
+      const current = await tx.posOrder.findUnique({
+        where: { id },
+        include: { items: true, returns: true },
+      })
+      if (!current) throw new Error('الفاتورة غير موجودة')
+      if (current.status !== 'completed') throw new Error('الفاتورة ملغاة بالفعل')
+      if (current.returns.length > 0) throw new Error('لا يمكن إلغاء فاتورة لها مرتجعات مسجلة')
+
       const o = await tx.posOrder.update({
         where: { id },
         data: { status: 'voided' },
@@ -639,9 +654,9 @@ function setupIpcHandlers() {
             sourceId: id,
             lines: {
               create: je.lines.map(l => ({
-                accountId:   l.accountId,
-                debit:       l.credit,
-                credit:      l.debit,
+                accountId: l.accountId,
+                debit: l.credit,
+                credit: l.debit,
                 description: l.description,
               })),
             },
@@ -656,10 +671,43 @@ function setupIpcHandlers() {
   })
 
   ipcMain.handle('pos:createReturn', async (_, { orderId, items, reason }) => {
-    const total = items.reduce((s: number, i: any) => s + i.total, 0)
-    const ret   = await prisma.$transaction(async (tx) => {
+    if (!Array.isArray(items) || items.length === 0) throw new Error('حدد أصناف المرتجع')
+    const ret = await prisma.$transaction(async (tx) => {
+      const order = await tx.posOrder.findUnique({
+        where: { id: orderId },
+        include: { items: true, returns: { include: { items: true } } },
+      })
+      if (!order || order.status !== 'completed') throw new Error('الفاتورة غير موجودة أو ملغاة')
+
+      const requestedByProduct = new Map<number, number>()
+      for (const item of items) {
+        if (!Number.isInteger(item.productId) || !Number.isFinite(item.quantity) || item.quantity <= 0) {
+          throw new Error('كمية المرتجع غير صالحة')
+        }
+        requestedByProduct.set(item.productId, (requestedByProduct.get(item.productId) ?? 0) + item.quantity)
+      }
+
+      const normalizedItems = [...requestedByProduct.entries()].map(([productId, quantity]) => {
+        const soldItems = order.items.filter(i => i.productId === productId)
+        if (soldItems.length === 0) throw new Error('الصنف غير موجود في الفاتورة الأصلية')
+        const soldQuantity = soldItems.reduce((sum, item) => sum + item.quantity, 0)
+        const alreadyReturned = order.returns.reduce((sum, ret) =>
+          sum + ret.items.filter(item => item.productId === productId).reduce((part, item) => part + item.quantity, 0), 0)
+        if (quantity > soldQuantity - alreadyReturned) {
+          throw new Error(`كمية المرتجع تتجاوز الكمية المباعة للصنف ${soldItems[0].productName}`)
+        }
+        const unitPrice = soldItems[0].unitPrice
+        return {
+          productId,
+          productName: soldItems[0].productName,
+          quantity,
+          unitPrice,
+          total: quantity * unitPrice,
+        }
+      })
+      const total = normalizedItems.reduce((sum, item) => sum + item.total, 0)
       const r = await tx.saleReturn.create({
-        data: { orderId, reason, total, items: { create: items } },
+        data: { orderId, reason, total, items: { create: normalizedItems } },
         include: { items: true },
       })
       for (const item of r.items) {
@@ -677,7 +725,7 @@ function setupIpcHandlers() {
     try {
       const [salesAcc, cashAcc, cogsAcc, invAcc] = await Promise.all([
         findAccByCode('4111'), findAccByCode('1111'),
-        findAccByCode('521'),  findAccByCode('1131'),
+        findAccByCode('521'), findAccByCode('1131'),
       ])
       if (salesAcc && cashAcc) {
         await autoJE({
@@ -687,20 +735,19 @@ function setupIpcHandlers() {
           source: 'sale',
           sourceId: ret.id,
           lines: [
-            { accountId: salesAcc.id, debit: total, credit: 0,     description: 'مرتجع مبيعات' },
-            { accountId: cashAcc.id,  debit: 0,     credit: total, description: 'استرداد نقدي' },
+            { accountId: salesAcc.id, debit: ret.total, credit: 0, description: 'مرتجع مبيعات' },
+            { accountId: cashAcc.id, debit: 0, credit: ret.total, description: 'استرداد نقدي' },
           ],
         })
       }
       if (cogsAcc && invAcc) {
         const productIds = [...new Set(ret.items.map(i => i.productId))]
-        const products   = await prisma.product.findMany({
+        const products = await prisma.product.findMany({
           where: { id: { in: productIds } },
           select: { id: true, costPrice: true },
         })
         const costMap = new Map(products.map(p => [p.id, p.costPrice]))
-        let cost = 0
-        for (const item of ret.items) cost += item.quantity * (costMap.get(item.productId) ?? 0)
+        const cost = ret.items.reduce((sum, item) => sum + item.quantity * (costMap.get(item.productId) ?? 0), 0)
         if (cost > 0) {
           await autoJE({
             date: new Date(ret.returnDate),
@@ -709,8 +756,8 @@ function setupIpcHandlers() {
             source: 'sale',
             sourceId: ret.id,
             lines: [
-              { accountId: invAcc.id,  debit: cost, credit: 0,    description: 'إعادة مخزون' },
-              { accountId: cogsAcc.id, debit: 0,    credit: cost, description: 'عكس تكلفة' },
+              { accountId: invAcc.id, debit: cost, credit: 0, description: 'إعادة مخزون' },
+              { accountId: cogsAcc.id, debit: 0, credit: cost, description: 'عكس تكلفة' },
             ],
           })
         }
@@ -721,13 +768,6 @@ function setupIpcHandlers() {
 
     return ret
   })
-
-  ipcMain.handle('pos:getReturns', () =>
-    prisma.saleReturn.findMany({
-      include: { order: true, items: { include: { product: true } } },
-      orderBy: { returnDate: 'desc' },
-    })
-  )
 
   // ─── STOCK ─────────────────────────────────────────────────────
   ipcMain.handle('stock:getMovements', (_, productId?: number) =>
@@ -979,26 +1019,32 @@ function setupIpcHandlers() {
     prisma.inventoryCountItem.update({ where: { id }, data: { actualQuantity } })
   )
 
-  ipcMain.handle('inventory:close', async (_, id: number) => {
-    const count = await prisma.inventoryCount.findUnique({
-      where: { id },
-      include: { items: true },
-    })
-    if (!count) throw new Error('Not found')
-    for (const item of count.items) {
-      const diff = item.actualQuantity - item.systemQuantity
-      await prisma.product.update({ where: { id: item.productId }, data: { currentStock: item.actualQuantity } })
-      if (diff !== 0) {
-        await prisma.stockMovement.create({
-          data: { productId: item.productId, quantity: diff, type: 'adjust', note: `جرد #${count.referenceNumber}` },
+  ipcMain.handle('inventory:close', async (_, id: number) =>
+    prisma.$transaction(async (tx) => {
+      const count = await tx.inventoryCount.findUnique({
+        where: { id },
+        include: { items: true },
+      })
+      if (!count) throw new Error('الجرد غير موجود')
+      if (count.status === 'closed') throw new Error('تم إغلاق هذا الجرد بالفعل')
+      for (const item of count.items) {
+        const diff = item.actualQuantity - item.systemQuantity
+        await tx.product.update({
+          where: { id: item.productId },
+          data: { currentStock: item.actualQuantity },
         })
+        if (diff !== 0) {
+          await tx.stockMovement.create({
+            data: { productId: item.productId, quantity: diff, type: 'adjust', note: `جرد #${count.referenceNumber}` },
+          })
+        }
       }
-    }
-    return prisma.inventoryCount.update({
-      where: { id },
-      data: { status: 'closed', closedAt: new Date() },
+      return tx.inventoryCount.update({
+        where: { id },
+        data: { status: 'closed', closedAt: new Date() },
+      })
     })
-  })
+  )
 
   ipcMain.handle('inventory:delete', (_, id: number) =>
     prisma.inventoryCount.delete({ where: { id } })
