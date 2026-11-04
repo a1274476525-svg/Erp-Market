@@ -55,6 +55,12 @@ export default function Branches() {
                   </div>
                   <div className="flex items-center gap-2">
                     {b.isDefault && <Badge label="رئيسي" color="emerald" />}
+                    {!b.isDefault && (
+                      <button onClick={() => window.api.branches.setDefault(b.id).then(load)}
+                        className="text-xs px-2 py-1 text-emerald-600 hover:bg-emerald-50 rounded">
+                        تعيين كفرع رئيسي
+                      </button>
+                    )}
                     <button onClick={() => { setEditingBranch(b); setShowBranchForm(true) }}
                       className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg">
                       <Edit2 size={14} />
