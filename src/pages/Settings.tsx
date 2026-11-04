@@ -11,6 +11,9 @@ export default function SettingsPage() {
   const [saved, setSaved]     = useState(false)
   const [clearSections, setClearSections] = useState<string[]>([])
   const [showClearModal, setShowClearModal] = useState(false)
+  const [clearPassword, setClearPassword] = useState('')
+  const [clearing, setClearing] = useState(false)
+  const [clearError, setClearError] = useState('')
   const set = (k: keyof AppSettings, v: string) => setForm(f => ({ ...f, [k]: v }))
 
   async function save() {
@@ -125,7 +128,12 @@ export default function SettingsPage() {
       </div>
 
       {showClearModal && (
-        <Modal title="مسح البيانات" onClose={() => setShowClearModal(false)}>
+        <Modal title="مسح البيانات" onClose={() => {
+          if (clearing) return
+          setShowClearModal(false)
+          setClearPassword('')
+          setClearError('')
+        }}>
           <div className="space-y-3">
             <label className="flex items-center gap-2 text-sm font-medium">
               <input type="checkbox" checked={clearSections.length === 12}
@@ -141,20 +149,48 @@ export default function SettingsPage() {
                 </label>
               ))}
             </div>
-            <button onClick={async () => {
-              const sections = clearSections.length === 12 ? undefined : clearSections
-              if (!sections && clearSections.length !== 11) return
-              if (clearSections.length === 0) return alert('اختر قسمًا')
-              if (!confirm('تأكيد: سيتم الحذف ولا يمكن التراجع. متابعة؟')) return
-              const pw = prompt('أدخل كلمة مرور المدير:')
-              if (pw === null) return
-              try {
-                const ok = await window.api.system.clearAllData(sections, pw)
-                if (ok) { alert('تم مسح البيانات بنجاح'); setShowClearModal(false); window.location.reload() }
-              } catch (e: any) { alert(e?.message || 'فشل') }
-            }}
-              className="w-full border border-red-200 text-red-700 py-2 rounded-lg text-sm font-medium hover:bg-red-50 transition-colors">
-              تأكيد المسح
+            <div className="border-t pt-3 space-y-2">
+              <label className="block text-sm font-medium text-slate-700">كلمة مرور المدير مطلوبة لتأكيد الحذف</label>
+              <input
+                type="password"
+                value={clearPassword}
+                onChange={e => { setClearPassword(e.target.value); setClearError('') }}
+                autoComplete="current-password"
+                placeholder="أدخل كلمة المرور"
+                disabled={clearing}
+                className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-red-500"
+              />
+              {clearError && <p role="alert" className="text-sm text-red-600">{clearError}</p>}
+            </div>
+            <button
+              disabled={clearing || clearSections.length === 0 || !clearPassword.trim()}
+              onClick={async () => {
+                if (clearSections.length === 0) {
+                  setClearError('اختر قسمًا واحدًا على الأقل')
+                  return
+                }
+                if (!clearPassword.trim()) {
+                  setClearError('أدخل كلمة مرور المدير')
+                  return
+                }
+                if (!confirm('تحذير: سيتم حذف البيانات المحددة نهائيًا ولا يمكن التراجع. هل تريد المتابعة؟')) return
+                setClearing(true)
+                setClearError('')
+                try {
+                  const sections = clearSections.length === 12 ? undefined : clearSections
+                  const result = await window.api.system.clearAllData(sections, clearPassword)
+                  if (result?.ok !== true) throw new Error('لم يؤكد النظام إتمام عملية الحذف')
+                  alert('تم مسح البيانات بنجاح')
+                  setShowClearModal(false)
+                  window.location.reload()
+                } catch (e: any) {
+                  setClearError(e?.message || 'فشل مسح البيانات')
+                } finally {
+                  setClearing(false)
+                }
+              }}
+              className="w-full border border-red-200 text-red-700 py-2 rounded-lg text-sm font-medium hover:bg-red-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors">
+              {clearing ? 'جارٍ مسح البيانات...' : 'تأكيد المسح'}
             </button>
           </div>
         </Modal>
