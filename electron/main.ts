@@ -1133,22 +1133,38 @@ function setupIpcHandlers() {
   )
 
   ipcMain.handle('auth:login', async (_, userId: number, pin: string) => {
-    const user = await prisma.user.findFirst({ where: { id: userId, pin, isActive: true } })
+    if (!Number.isInteger(userId) || typeof pin !== 'string') return null
+    const user = await prisma.user.findFirst({
+      where: { id: userId, pin, isActive: true },
+      select: { id: true, name: true, role: true, isActive: true, createdAt: true },
+    })
     if (!user) return null
     const roleData = await resolveRole(user.role)
+    if (!roleData) return null
     return { ...user, roleData }
   })
 
+  // Never send stored PINs to the renderer.
   ipcMain.handle('auth:getAll', () =>
-    prisma.user.findMany({ orderBy: { name: 'asc' } })
+    prisma.user.findMany({
+      select: { id: true, name: true, role: true, isActive: true, createdAt: true },
+      orderBy: { name: 'asc' },
+    })
   )
 
   ipcMain.handle('auth:create', (_, data) =>
-    prisma.user.create({ data })
+    prisma.user.create({
+      data,
+      select: { id: true, name: true, role: true, isActive: true, createdAt: true },
+    })
   )
 
   ipcMain.handle('auth:update', (_, { id, ...data }) =>
-    prisma.user.update({ where: { id }, data })
+    prisma.user.update({
+      where: { id },
+      data,
+      select: { id: true, name: true, role: true, isActive: true, createdAt: true },
+    })
   )
 
   ipcMain.handle('auth:delete', (_, id: number) =>
@@ -1187,7 +1203,7 @@ function setupIpcHandlers() {
       autoBackupInterval: 'daily',
       autoBackupLastRun: '',
     }
-    rows.forEach(r => { map[r.key] = r.value })
+    rows.forEach(r => { if (r.key !== 'clearDataPassword') map[r.key] = r.value })
     return map
   })
 
