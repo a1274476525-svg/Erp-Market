@@ -87,6 +87,17 @@ function createWindow() {
   mainWindow.once('ready-to-show', () => mainWindow?.show())
 }
 
+async function upgradeLegacyPins() {
+  await prisma.$transaction(async (tx) => {
+    const users = await tx.user.findMany({ select: { id: true, pin: true } })
+    for (const user of users) {
+      if (!user.pin.startsWith('scrypt$')) {
+        await tx.user.update({ where: { id: user.id }, data: { pin: hashPin(user.pin) } })
+      }
+    }
+  })
+}
+
 async function ensureSystemRole() {
   let sysRole = await prisma.role.findFirst({ where: { isSystem: true } })
   if (!sysRole) {
@@ -143,6 +154,7 @@ async function checkAutoBackup() {
 
 app.whenReady().then(async () => {
   await ensureDatabaseFile()
+  await upgradeLegacyPins()
   await ensureSystemRole()
   await checkAutoBackup()
   createWindow()
