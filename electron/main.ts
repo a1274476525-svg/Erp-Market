@@ -1040,13 +1040,32 @@ function setupIpcHandlers() {
     prisma.branch.update({ where: { id }, data })
   )
 
-  ipcHandle('branches:delete', async (_, id: number) => {
-    const branch = await prisma.branch.findUnique({ where: { id }, include: { warehouses: true } })
-    if (!branch) throw new Error('الفرع غير موجود')
-    if (branch.isDefault) throw new Error('لا يمكن حذف الفرع الرئيسي')
-    if (branch.warehouses.length > 0) throw new Error('احذف أو انقل مخازن الفرع أولاً')
-    return prisma.branch.delete({ where: { id } })
-  })
+  ipcHandle('branches:delete', async (_, id: number) =>
+    prisma.$transaction(async (tx) => {
+      const branch = await tx.branch.findUnique({
+        where: { id },
+        include: { warehouses: { include: { stocks: true } } },
+      })
+      if (!branch) throw new Error('الفرع غير موجود')
+      if (branch.isDefault) throw new Error('لا يمكن حذف الفرع الرئيسي')
+      if (branch.warehouses.some(warehouse => warehouse.stocks.some(stock => Math.abs(stock.quantity) > 0.000001))) {
+        throw new Error('لا يمكن حذف فرع يحتوي على مخزون. انقل الأرصدة أولاً')
+      }
+      for (const warehouse of branch.warehouses) {
+        const [fromRequests, toRequests, fromTransfers, toTransfers] = await Promise.all([
+          tx.transferRequest.count({ where: { fromWarehouseId: warehouse.id } }),
+          tx.transferRequest.count({ where: { toWarehouseId: warehouse.id } }),
+          tx.transfer.count({ where: { fromWarehouseId: warehouse.id } }),
+          tx.transfer.count({ where: { toWarehouseId: warehouse.id } }),
+        ])
+        if (fromRequests + toRequests + fromTransfers + toTransfers > 0) {
+          throw new Error('لا يمكن حذف فرع مرتبط بطلبات أو تحويلات سابقة')
+        }
+      }
+      await tx.warehouse.deleteMany({ where: { branchId: id } })
+      return tx.branch.delete({ where: { id } })
+    })
+  )
 
   // ─── WAREHOUSES ────────────────────────────────────────────────
   ipcHandle('warehouses:init', async () =>
@@ -1532,9 +1551,19 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcHandle('auth:delete', (_, id: number) =>
-    prisma.user.delete({ where: { id } })
-  )
+  ipcHandle('auth:delete', async (event, id: number) => {
+    if (authenticatedSessions.get(event.sender.id) === id) {
+      throw new Error('لا يمكنك حذف حسابك أثناء تسجيل الدخول')
+    }
+    const user = await prisma.user.findUnique({ where: { id } })
+    if (!user) throw new Error('المستخدم غير موجود')
+    const role = await resolveRole(user.role)
+    if (role?.fullAccess) {
+      const admins = await prisma.user.count({ where: { isActive: true, role: user.role } })
+      if (admins <= 1) throw new Error('لا يمكن حذف آخر مدير نشط في النظام')
+    }
+    return prisma.user.delete({ where: { id } })
+  })
 
   // ─── ROLES ─────────────────────────────────────────────────────
   ipcHandle('roles:getAll', async () => {
