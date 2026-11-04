@@ -76,15 +76,37 @@ export default function POS() {
   const { user } = useAuth()
 
   useEffect(() => {
-    Promise.all([
-      window.api.products.getAll(),
-      window.api.customers.getAll(),
-      window.api.promotions.getAll(),
-    ]).then(([p, c, pr]) => {
-      setProducts(p)
-      setCustomers(c)
-      setPromotions(pr.filter((p: Promotion) => p.isActive))
-    })
+    let cancelled = false
+    async function load() {
+      try {
+        await window.api.warehouses.init()
+        const [allProducts, c, pr, warehouses] = await Promise.all([
+          window.api.products.getAll(),
+          window.api.customers.getAll(),
+          window.api.promotions.getAll(),
+          window.api.warehouses.getAll(),
+        ])
+        if (cancelled) return
+        const defaultWarehouse =
+          warehouses.find(w => w.isDefault && w.branch?.isDefault) ??
+          warehouses.find(w => w.isDefault)
+        const stockByProduct = new Map<number, number>(
+          (defaultWarehouse?.stocks ?? []).map(stock => [stock.productId, stock.quantity])
+        )
+        setProducts(allProducts.map(product => ({
+          ...product,
+          // POS availability is the selected default branch's warehouse balance,
+          // not the sum of stock held in other branches.
+          currentStock: stockByProduct.get(product.id) ?? 0,
+        })))
+        setCustomers(c)
+        setPromotions(pr.filter((promotion: Promotion) => promotion.isActive))
+      } catch (error: any) {
+        alert(error?.message || 'تعذر تحميل بيانات نقطة البيع')
+      }
+    }
+    load()
+    return () => { cancelled = true }
   }, [])
 
   function getActivePromotion(product: Product): Promotion | null {
