@@ -159,7 +159,7 @@ contextBridge.exposeInMainWorld('api', {
     selectFolder: () => ipcRenderer.invoke('backup:selectFolder'),
   },
   system: {
-    clearAllData:     (sections?: string[], password?: string) => ipcRenderer.invoke('system:clearAllData', sections, password),
+    clearAllData:     (sections: string[], userId: number, pin: string) => ipcRenderer.invoke('system:clearAllData', { sections, userId, pin }),
     autoBackupStatus: () => ipcRenderer.invoke('system:autoBackupStatus'),
   },
   expenseCategories: {
