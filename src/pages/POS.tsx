@@ -91,7 +91,7 @@ export default function POS() {
           warehouses.find(w => w.isDefault && w.branch?.isDefault) ??
           warehouses.find(w => w.isDefault)
         const stockByProduct = new Map<number, number>(
-          (defaultWarehouse?.stocks ?? []).map(stock => [stock.productId, stock.quantity])
+          (defaultWarehouse?.stocks ?? []).map((stock: any) => [stock.productId, stock.quantity])
         )
         setProducts(allProducts.map(product => ({
           ...product,
