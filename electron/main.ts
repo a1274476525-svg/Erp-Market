@@ -881,12 +881,15 @@ function setupIpcHandlers() {
   })
 
   ipcMain.handle('warehouses:syncStock', async (_, warehouseId: number) => {
+    const warehouse = await prisma.warehouse.findUnique({ where: { id: warehouseId } })
+    if (!warehouse) throw new Error('المخزن غير موجود')
     const products = await prisma.product.findMany()
     for (const p of products) {
       await prisma.warehouseStock.upsert({
         where: { warehouseId_productId: { warehouseId, productId: p.id } },
         update: {},
-        create: { warehouseId, productId: p.id, quantity: 0 },
+        // Seed the default warehouse from the legacy/global product stock on first sync.
+        create: { warehouseId, productId: p.id, quantity: warehouse.isDefault ? p.currentStock : 0 },
       })
     }
   })
@@ -959,15 +962,11 @@ function setupIpcHandlers() {
 
       for (const item of transfer.items) {
         if (!Number.isFinite(item.quantity) || item.quantity <= 0) throw new Error('كمية تحويل غير صالحة')
-        const deducted = await tx.warehouseStock.updateMany({
-          where: {
-            warehouseId: req.fromWarehouseId,
-            productId: item.productId,
-            quantity: { gte: item.quantity },
-          },
-          data: { quantity: { decrement: item.quantity } },
+        await tx.warehouseStock.upsert({
+          where: { warehouseId_productId: { warehouseId: req.fromWarehouseId, productId: item.productId } },
+          update: { quantity: { decrement: item.quantity } },
+          create: { warehouseId: req.fromWarehouseId, productId: item.productId, quantity: -item.quantity },
         })
-        if (deducted.count !== 1) throw new Error('المخزون غير كافٍ في المخزن المصدر')
         await tx.warehouseStock.upsert({
           where: { warehouseId_productId: { warehouseId: req.toWarehouseId, productId: item.productId } },
           update: { quantity: { increment: item.quantity } },
@@ -991,15 +990,11 @@ function setupIpcHandlers() {
       })
       for (const item of transfer.items) {
         if (!Number.isFinite(item.quantity) || item.quantity <= 0) throw new Error('كمية تحويل غير صالحة')
-        const deducted = await tx.warehouseStock.updateMany({
-          where: {
-            warehouseId: data.fromWarehouseId,
-            productId: item.productId,
-            quantity: { gte: item.quantity },
-          },
-          data: { quantity: { decrement: item.quantity } },
+        await tx.warehouseStock.upsert({
+          where: { warehouseId_productId: { warehouseId: data.fromWarehouseId, productId: item.productId } },
+          update: { quantity: { decrement: item.quantity } },
+          create: { warehouseId: data.fromWarehouseId, productId: item.productId, quantity: -item.quantity },
         })
-        if (deducted.count !== 1) throw new Error('المخزون غير كافٍ في المخزن المصدر')
         await tx.warehouseStock.upsert({
           where: { warehouseId_productId: { warehouseId: data.toWarehouseId, productId: item.productId } },
           update: { quantity: { increment: item.quantity } },
@@ -1015,15 +1010,11 @@ function setupIpcHandlers() {
       const transfer = await tx.transfer.findUnique({ where: { id }, include: { items: true } })
       if (!transfer) throw new Error('التحويل غير موجود')
       for (const item of transfer.items) {
-        const deducted = await tx.warehouseStock.updateMany({
-          where: {
-            warehouseId: transfer.toWarehouseId,
-            productId: item.productId,
-            quantity: { gte: item.quantity },
-          },
-          data: { quantity: { decrement: item.quantity } },
+        await tx.warehouseStock.upsert({
+          where: { warehouseId_productId: { warehouseId: transfer.toWarehouseId, productId: item.productId } },
+          update: { quantity: { decrement: item.quantity } },
+          create: { warehouseId: transfer.toWarehouseId, productId: item.productId, quantity: -item.quantity },
         })
-        if (deducted.count !== 1) throw new Error('لا يمكن حذف التحويل: الكمية لم تعد متاحة في المخزن المستلم')
         await tx.warehouseStock.upsert({
           where: { warehouseId_productId: { warehouseId: transfer.fromWarehouseId, productId: item.productId } },
           update: { quantity: { increment: item.quantity } },
