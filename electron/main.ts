@@ -230,7 +230,13 @@ const STANDARD_ACCOUNTS: { code: string; name: string; type: string; nb: string;
 function setupIpcHandlers() {
   async function getDefaultWarehouse(tx: Prisma.TransactionClient) {
     let branch = await tx.branch.findFirst({ where: { isDefault: true } })
-    if (!branch) branch = await tx.branch.findFirst({ orderBy: { id: 'asc' } })
+    if (!branch) {
+      branch = await tx.branch.findFirst({ orderBy: { id: 'asc' } })
+      if (branch) {
+        await tx.branch.updateMany({ data: { isDefault: false } })
+        branch = await tx.branch.update({ where: { id: branch.id }, data: { isDefault: true } })
+      }
+    }
     if (!branch) branch = await tx.branch.create({ data: { name: 'الفرع الرئيسي', isDefault: true } })
 
     let warehouse = await tx.warehouse.findFirst({
@@ -1058,6 +1064,11 @@ function setupIpcHandlers() {
       if (req.status !== 'approved') throw new Error('يجب الموافقة على طلب التحويل أولاً')
       if (req.fromWarehouseId === req.toWarehouseId) throw new Error('لا يمكن التحويل إلى نفس المخزن')
       if (req.items.length === 0) throw new Error('طلب التحويل لا يحتوي على أصناف')
+      const [source, destination] = await Promise.all([
+        tx.warehouse.findUnique({ where: { id: req.fromWarehouseId } }),
+        tx.warehouse.findUnique({ where: { id: req.toWarehouseId } }),
+      ])
+      if (!source || !destination) throw new Error('المخزن المصدر أو المستلم غير موجود')
 
       const maxTransfer = await tx.transfer.aggregate({ _max: { id: true } })
       const ref = `TRF-${String((maxTransfer._max.id ?? 0) + 1).padStart(5, '0')}`
@@ -1074,16 +1085,8 @@ function setupIpcHandlers() {
 
       for (const item of transfer.items) {
         if (!Number.isFinite(item.quantity) || item.quantity <= 0) throw new Error('كمية تحويل غير صالحة')
-        await tx.warehouseStock.upsert({
-          where: { warehouseId_productId: { warehouseId: req.fromWarehouseId, productId: item.productId } },
-          update: { quantity: { decrement: item.quantity } },
-          create: { warehouseId: req.fromWarehouseId, productId: item.productId, quantity: -item.quantity },
-        })
-        await tx.warehouseStock.upsert({
-          where: { warehouseId_productId: { warehouseId: req.toWarehouseId, productId: item.productId } },
-          update: { quantity: { increment: item.quantity } },
-          create: { warehouseId: req.toWarehouseId, productId: item.productId, quantity: item.quantity },
-        })
+        await changeWarehouseStock(tx, req.fromWarehouseId, item.productId, -item.quantity)
+        await changeWarehouseStock(tx, req.toWarehouseId, item.productId, item.quantity)
       }
       await tx.transferRequest.update({ where: { id: requestId }, data: { status: 'transferred' } })
       return transfer
@@ -1096,22 +1099,20 @@ function setupIpcHandlers() {
       if (data.fromWarehouseId === data.toWarehouseId) throw new Error('لا يمكن التحويل إلى نفس المخزن')
       const maxTransfer = await tx.transfer.aggregate({ _max: { id: true } })
       const ref = `TRF-${String((maxTransfer._max.id ?? 0) + 1).padStart(5, '0')}`
+      const [fromWarehouse, toWarehouse] = await Promise.all([
+        tx.warehouse.findUnique({ where: { id: data.fromWarehouseId } }),
+        tx.warehouse.findUnique({ where: { id: data.toWarehouseId } }),
+      ])
+      if (!fromWarehouse || !toWarehouse) throw new Error('المخزن المصدر أو المستلم غير موجود')
+      if (!Array.isArray(items) || items.length === 0) throw new Error('أضف أصناف التحويل')
       const transfer = await tx.transfer.create({
         data: { ...data, referenceNumber: ref, items: { create: items } },
         include: { items: true },
       })
       for (const item of transfer.items) {
         if (!Number.isFinite(item.quantity) || item.quantity <= 0) throw new Error('كمية تحويل غير صالحة')
-        await tx.warehouseStock.upsert({
-          where: { warehouseId_productId: { warehouseId: data.fromWarehouseId, productId: item.productId } },
-          update: { quantity: { decrement: item.quantity } },
-          create: { warehouseId: data.fromWarehouseId, productId: item.productId, quantity: -item.quantity },
-        })
-        await tx.warehouseStock.upsert({
-          where: { warehouseId_productId: { warehouseId: data.toWarehouseId, productId: item.productId } },
-          update: { quantity: { increment: item.quantity } },
-          create: { warehouseId: data.toWarehouseId, productId: item.productId, quantity: item.quantity },
-        })
+        await changeWarehouseStock(tx, data.fromWarehouseId, item.productId, -item.quantity)
+        await changeWarehouseStock(tx, data.toWarehouseId, item.productId, item.quantity)
       }
       return transfer
     })
@@ -1122,16 +1123,8 @@ function setupIpcHandlers() {
       const transfer = await tx.transfer.findUnique({ where: { id }, include: { items: true } })
       if (!transfer) throw new Error('التحويل غير موجود')
       for (const item of transfer.items) {
-        await tx.warehouseStock.upsert({
-          where: { warehouseId_productId: { warehouseId: transfer.toWarehouseId, productId: item.productId } },
-          update: { quantity: { decrement: item.quantity } },
-          create: { warehouseId: transfer.toWarehouseId, productId: item.productId, quantity: -item.quantity },
-        })
-        await tx.warehouseStock.upsert({
-          where: { warehouseId_productId: { warehouseId: transfer.fromWarehouseId, productId: item.productId } },
-          update: { quantity: { increment: item.quantity } },
-          create: { warehouseId: transfer.fromWarehouseId, productId: item.productId, quantity: item.quantity },
-        })
+        await changeWarehouseStock(tx, transfer.toWarehouseId, item.productId, -item.quantity)
+        await changeWarehouseStock(tx, transfer.fromWarehouseId, item.productId, item.quantity)
       }
       const deleted = await tx.transfer.delete({ where: { id } })
       if (transfer.requestId) {
