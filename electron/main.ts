@@ -1881,7 +1881,7 @@ function setupIpcHandlers() {
     })
   }
 
-  async function postSaleJE(order: { id: number; orderNumber: string; createdAt: Date; total: number; subtotal: number; taxAmount: number; paymentMethod: string; items: { productId: number; quantity: number }[] }) {
+  async function postSaleJE(order: { id: number; orderNumber: string; createdAt: Date; total: number; subtotal: number; discountAmount: number; taxAmount: number; paymentMethod: string; items: { productId: number; quantity: number }[] }) {
     await ensureStandardAccounts()
     const [cashAcc, bankAcc, salesAcc, vatAcc, cogsAcc, invAcc] = await Promise.all([
       findAccByCode('1111'), findAccByCode('1112'),
@@ -1890,10 +1890,15 @@ function setupIpcHandlers() {
     ])
     const drAcc = order.paymentMethod === 'cash' ? cashAcc : bankAcc
     if (!drAcc || !salesAcc) throw new Error('تعذر إيجاد حسابات النقدية/المبيعات في دليل الحسابات')
+    const discountAmount = Number(order.discountAmount ?? 0)
+    if (!Number.isFinite(discountAmount) || discountAmount < 0 || discountAmount > order.subtotal) {
+      throw new Error('قيمة خصم فاتورة البيع غير صالحة')
+    }
+    const netSales = order.subtotal - discountAmount
 
     const salesLines: { accountId: number; debit: number; credit: number; description?: string }[] = [
       { accountId: drAcc.id,    debit: order.total,    credit: 0,              description: order.orderNumber },
-      { accountId: salesAcc.id, debit: 0,              credit: order.subtotal, description: order.orderNumber },
+      { accountId: salesAcc.id, debit: 0,              credit: netSales, description: order.orderNumber },
     ]
     if (order.taxAmount > 0 && vatAcc) {
       salesLines.push({ accountId: vatAcc.id, debit: 0, credit: order.taxAmount, description: 'ض.ق.م مبيعات' })
