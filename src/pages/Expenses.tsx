@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
-import { Plus, Pencil, Trash2, X, Wallet, Tag, ChevronDown } from 'lucide-react'
+import { Plus, Pencil, Trash2, X, Wallet, Tag, ChevronDown, Download, Upload } from 'lucide-react'
+import * as XLSX from 'xlsx'
 import { format } from 'date-fns'
 import { ar } from 'date-fns/locale'
 import { useSettings } from '../contexts/SettingsContext'
@@ -164,6 +165,7 @@ export default function Expenses() {
   const [filterFrom, setFilterFrom]     = useState('')
   const [filterTo, setFilterTo]         = useState('')
   const [filterCat, setFilterCat]       = useState(0)
+  const [importingCategories, setImportingCategories] = useState(false)
 
   async function loadCategories() {
     setCategories(await window.api.expenseCategories.getAll())
@@ -188,6 +190,61 @@ export default function Expenses() {
     }
     await loadCategories()
     setCatModal(false)
+  }
+
+  function downloadCategoryTemplate() {
+    const sheet = XLSX.utils.aoa_to_sheet([
+      ['الاسم', 'الوصف'],
+      ['إيجار', 'مصروف إيجار المحل'],
+      ['كهرباء', 'فاتورة الكهرباء'],
+    ])
+    const workbook = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(workbook, sheet, 'أنواع المصاريف')
+    XLSX.writeFile(workbook, 'قالب_استيراد_أنواع_المصاريف.xlsx')
+  }
+
+  async function importCategoryFile(file?: File) {
+    if (!file) return
+    setImportingCategories(true)
+    try {
+      const workbook = XLSX.read(await file.arrayBuffer(), { type: 'array' })
+      const firstSheet = workbook.Sheets[workbook.SheetNames[0]]
+      if (!firstSheet) throw new Error('الملف لا يحتوي على ورقة بيانات')
+      const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(firstSheet, { defval: '' })
+      if (!rows.length) throw new Error('لا توجد صفوف بيانات في الملف')
+
+      const existing = new Set(categories.map(c => c.name.trim().toLocaleLowerCase()))
+      const seen = new Set<string>()
+      const valid: { name: string; description: string }[] = []
+      const errors: string[] = []
+      rows.forEach((row, index) => {
+        const nameValue = row['الاسم'] ?? row['name'] ?? row['Name']
+        const descriptionValue = row['الوصف'] ?? row['description'] ?? row['Description'] ?? ''
+        const name = String(nameValue ?? '').trim()
+        const description = String(descriptionValue ?? '').trim()
+        if (!name) {
+          errors.push(`صف ${index + 2}: الاسم مطلوب`)
+          return
+        }
+        const key = name.toLocaleLowerCase()
+        if (existing.has(key) || seen.has(key)) return
+        seen.add(key)
+        valid.push({ name, description })
+      })
+
+      let imported = 0
+      for (const category of valid) {
+        await window.api.expenseCategories.create(category)
+        imported += 1
+      }
+      await loadCategories()
+      const skipped = rows.length - imported
+      window.alert(`تم استيراد ${imported} نوع مصروف. تم تخطي ${skipped} صف (مكرر أو غير صالح).${errors.length ? '\\n' + errors.slice(0, 8).join('\\n') : ''}`)
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : 'تعذر قراءة ملف Excel')
+    } finally {
+      setImportingCategories(false)
+    }
   }
 
   async function deleteCategory(id: number) {
@@ -362,10 +419,23 @@ export default function Expenses() {
         <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden">
           <div className="flex items-center justify-between px-5 py-4 border-b border-slate-100">
             <h2 className="font-semibold text-slate-700 text-sm">أنواع المصاريف ({categories.length})</h2>
-            <button onClick={() => setCatModal(null)}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold">
-              <Plus size={13} /> إضافة
-            </button>
+            <div className="flex items-center gap-2">
+              <button onClick={downloadCategoryTemplate}
+                className="flex items-center gap-1.5 px-3 py-1.5 border border-slate-200 text-slate-600 hover:bg-slate-50 rounded-lg text-xs font-semibold">
+                <Download size={13} /> تحميل القالب
+              </button>
+              <input id="expense-category-import" type="file" accept=".xlsx,.xls,.csv"
+                className="hidden" disabled={importingCategories}
+                onChange={e => { const file = e.target.files?.[0]; void importCategoryFile(file); e.currentTarget.value = '' }} />
+              <button onClick={() => document.getElementById('expense-category-import')?.click()} disabled={importingCategories}
+                className="flex items-center gap-1.5 px-3 py-1.5 border border-emerald-200 text-emerald-700 hover:bg-emerald-50 rounded-lg text-xs font-semibold disabled:opacity-50">
+                <Upload size={13} /> {importingCategories ? 'جارٍ الاستيراد...' : 'استيراد Excel'}
+              </button>
+              <button onClick={() => setCatModal(null)}
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold">
+                <Plus size={13} /> إضافة
+              </button>
+            </div>
           </div>
           {categories.length === 0 ? (
             <div className="text-center py-12 text-slate-400">
