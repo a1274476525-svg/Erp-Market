@@ -2622,24 +2622,65 @@ function setupIpcHandlers() {
   })
 
   ipcHandle('reports:cashFlow', async (_, { from, to }: any = {}) => {
-    const df: any = {}
-    if (from) { const d = new Date(from); d.setUTCHours(0,0,0,0); df.gte = d }
-    if (to)   { const d = new Date(to); d.setUTCDate(d.getUTCDate()+1); d.setUTCHours(0,0,0,0); df.lte = d }
-    const txs = await prisma.bankTransaction.findMany({
-      where: df.gte ? { date: df } : {},
-      include: { bankAccount: true },
-      orderBy: { date: 'asc' },
-    })
+    const dateFilter: any = {}
+    if (from) { const d = new Date(from); d.setUTCHours(0, 0, 0, 0); dateFilter.gte = d }
+    if (to)   { const d = new Date(to); d.setUTCDate(d.getUTCDate() + 1); d.setUTCHours(0, 0, 0, 0); dateFilter.lt = d }
+
+    // Build cash movement from posted journal entries, not only manually
+    // recorded bank transactions. BankTransaction remains supplementary detail.
+    const [bankAccounts, cashAccounts, entries, txs] = await Promise.all([
+      prisma.bankAccount.findMany({ where: { isActive: true }, include: { account: true } }),
+      prisma.account.findMany({ where: { isActive: true, code: { in: ['1111', '1112'] } } }),
+      prisma.journalEntry.findMany({
+        where: { status: 'posted', ...(Object.keys(dateFilter).length ? { date: dateFilter } : {}) },
+        include: { lines: { include: { account: true } } },
+        orderBy: { date: 'asc' },
+      }),
+      prisma.bankTransaction.findMany({
+        where: Object.keys(dateFilter).length ? { date: dateFilter } : {},
+        include: { bankAccount: true },
+        orderBy: { date: 'asc' },
+      }),
+    ])
+
+    const cashIds = new Set<number>()
+    for (const b of bankAccounts) if (b.accountId) cashIds.add(b.accountId)
+    for (const a of cashAccounts) cashIds.add(a.id)
+
     const byMonth: Record<string, { deposits: number; withdrawals: number }> = {}
-    for (const t of txs) {
-      const key = new Date(t.date).toISOString().slice(0, 7)
+    const transactions: any[] = []
+    let totalIn = 0
+    let totalOut = 0
+    for (const entry of entries) {
+      const cashLines = entry.lines.filter(line => cashIds.has(line.accountId))
+      const netCash = cashLines.reduce((sum, line) => sum + line.debit - line.credit, 0)
+      if (Math.abs(netCash) < 0.005) continue
+      const amount = Math.abs(netCash)
+      const key = new Date(entry.date).toISOString().slice(0, 7)
       if (!byMonth[key]) byMonth[key] = { deposits: 0, withdrawals: 0 }
-      if (t.type === 'deposit')    byMonth[key].deposits    += t.amount
-      if (t.type === 'withdrawal') byMonth[key].withdrawals += t.amount
+      if (netCash > 0) {
+        byMonth[key].deposits += amount
+        totalIn += amount
+      } else {
+        byMonth[key].withdrawals += amount
+        totalOut += amount
+      }
+      transactions.push({
+        id: entry.id,
+        date: entry.date,
+        description: entry.description || entry.reference || entry.number,
+        type: netCash > 0 ? 'deposit' : 'withdrawal',
+        amount,
+        journalEntryNumber: entry.number,
+      })
     }
-    const totalIn  = txs.filter(t => t.type === 'deposit').reduce((s, t) => s + t.amount, 0)
-    const totalOut = txs.filter(t => t.type === 'withdrawal').reduce((s, t) => s + t.amount, 0)
-    return { transactions: txs, byMonth, totals: { in: totalIn, out: totalOut, net: totalIn - totalOut } }
+    return {
+      transactions,
+      bankTransactions: txs,
+      byMonth,
+      totals: { in: totalIn, out: totalOut, net: totalIn - totalOut },
+      basis: 'posted_journal_entries',
+    }
   })
 
   ipcHandle('reports:arAging', async (_, { asOf }: any = {}) => {
