@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
-import { TrendingUp, TrendingDown, Scale, FileText, Receipt, RefreshCw } from 'lucide-react'
+import { TrendingUp, TrendingDown, Scale, FileText, Receipt, RefreshCw, Download } from 'lucide-react'
+import * as XLSX from 'xlsx'
 import { useSettings } from '../contexts/SettingsContext'
 
 interface FinancialData {
@@ -77,6 +78,53 @@ export default function FinancialReports() {
 
   useEffect(() => { load() }, [load])
 
+  function exportCurrentFinancialReport() {
+    if (!data) return
+    const rows: (string | number)[][] = [
+      [TAB_LABELS[tab]],
+      ['من تاريخ', from],
+      ['إلى تاريخ', to],
+      ['العملة', cur || ''],
+      [],
+    ]
+
+    if (tab === 'income') {
+      rows.push(['البند', 'القيمة'])
+      rows.push(['إيرادات المبيعات بدون الضريبة', data.revenue.total])
+      rows.push(['تكلفة البضاعة المباعة', -data.cogs])
+      rows.push(['مجمل الربح', data.grossProfit])
+      Object.entries(data.expenses.byCategory).forEach(([name, amount]) => rows.push([name, -amount]))
+      rows.push(['إجمالي المصروفات', -data.expenses.total])
+      rows.push(['صافي الربح / الخسارة', data.netProfit])
+    } else if (tab === 'balance') {
+      rows.push(['البند', 'القيمة'])
+      rows.push(['المخزون', data.inventory.value])
+      rows.push(['الصناديق والعهد', data.banks.cash])
+      rows.push(['البنوك', data.banks.bank])
+      rows.push(['إجمالي الأصول المعروضة', data.inventory.value + data.banks.cash + data.banks.bank])
+      rows.push(['ضريبة القيمة المضافة المستحقة', Math.max(data.vat.net, 0)])
+      rows.push(['صافي ربح / خسارة الفترة', data.netProfit])
+      rows.push(['إجمالي الخصوم وحقوق الملكية المعروضة', Math.max(data.vat.net, 0) + data.netProfit])
+    } else if (tab === 'trial') {
+      rows.push(['كود الحساب', 'الحساب', 'النوع', 'مدين', 'دائن'])
+      data.trialBalance.forEach(row => rows.push([row.code, row.name, row.type, row.debit, row.credit]))
+      rows.push(['', 'الإجمالي', '', data.trialBalance.reduce((sum, row) => sum + row.debit, 0), data.trialBalance.reduce((sum, row) => sum + row.credit, 0)])
+    } else {
+      rows.push(['البند', 'القيمة'])
+      rows.push(['وعاء مبيعات', data.revenue.total])
+      rows.push(['ضريبة مبيعات محصلة', data.vat.collected])
+      rows.push(['وعاء مشتريات', data.purchases.total])
+      rows.push(['ضريبة مشتريات مدفوعة', data.vat.paid])
+      rows.push(['صافي ضريبة القيمة المضافة', data.vat.net])
+      rows.push(['عدد فواتير المبيعات', data.ordersCount])
+      rows.push(['عدد فواتير المشتريات', data.invoicesCount])
+    }
+
+    const workbook = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(rows), TAB_LABELS[tab].slice(0, 31))
+    XLSX.writeFile(workbook, `التقارير_المالية_${tab}_${from}_${to}.xlsx`)
+  }
+
   if (!data && loading) return (
     <div className="p-6 flex items-center justify-center h-64">
       <RefreshCw size={24} className="animate-spin text-slate-400" />
@@ -97,6 +145,10 @@ export default function FinancialReports() {
           <button onClick={load} disabled={loading}
             className="flex items-center gap-2 bg-emerald-600 text-white px-4 py-2 rounded-lg text-sm hover:bg-emerald-700 disabled:opacity-50">
             <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> تحديث
+          </button>
+          <button onClick={exportCurrentFinancialReport} disabled={!data}
+            className="flex items-center gap-2 border border-emerald-200 text-emerald-700 px-4 py-2 rounded-lg text-sm hover:bg-emerald-50 disabled:opacity-50">
+            <Download size={15} /> تصدير Excel
           </button>
         </div>
       </div>
