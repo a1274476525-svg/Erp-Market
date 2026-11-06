@@ -1801,10 +1801,24 @@ function setupIpcHandlers() {
     lines: { accountId: number; debit: number; credit: number; description?: string }[]
   }) {
     const { date, description, reference, source, sourceId, lines } = opts
-    if (lines.length < 2) return null
+    if (lines.length < 2) throw new Error('القيد الآلي يجب أن يحتوي على سطرين على الأقل')
+    for (const line of lines) {
+      if (!Number.isFinite(line.debit) || !Number.isFinite(line.credit) || line.debit < 0 || line.credit < 0 || (line.debit > 0 && line.credit > 0)) {
+        throw new Error('قيمة مدين/دائن غير صالحة في القيد الآلي')
+      }
+    }
     const totalD = lines.reduce((s, l) => s + l.debit, 0)
     const totalC = lines.reduce((s, l) => s + l.credit, 0)
-    if (Math.abs(totalD - totalC) > 0.01) return null
+    if (Math.abs(totalD - totalC) > 0.01) {
+      throw new Error(`القيد الآلي غير متوازن: مدين ${totalD.toFixed(2)} ≠ دائن ${totalC.toFixed(2)}`)
+    }
+    // A source document may legitimately create multiple entries (e.g. sales
+    // revenue and COGS); the description distinguishes each posting. Return an
+    // existing matching entry on retries instead of duplicating it.
+    const existing = await prisma.journalEntry.findFirst({
+      where: { source, sourceId, description, status: 'posted' },
+    })
+    if (existing) return existing
     const number = await nextJENumber()
     return prisma.journalEntry.create({
       data: {
