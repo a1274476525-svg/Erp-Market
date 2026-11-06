@@ -1,4 +1,5 @@
-import { Printer, RefreshCw } from 'lucide-react'
+import { Download, Printer, RefreshCw } from 'lucide-react'
+import * as XLSX from 'xlsx'
 import { useSettings } from '../../contexts/SettingsContext'
 
 export function useCur() {
@@ -14,6 +15,35 @@ export const fmt = (n: number) =>
 
 export const fmtDate = (d: string | Date) =>
   new Date(d).toLocaleDateString('ar-EG', { year: 'numeric', month: 'short', day: 'numeric' })
+
+/** Export every rendered report table to a multi-sheet Excel workbook. */
+function exportVisibleReport(from: string, to: string) {
+  const tables = Array.from(document.querySelectorAll<HTMLTableElement>('.report-content table, main table, table'))
+  if (!tables.length) {
+    window.alert('لا توجد جداول ظاهرة لتصديرها في التقرير الحالي')
+    return
+  }
+
+  const heading = document.querySelector('h1, h2')?.textContent?.trim() || 'تقرير'
+  const workbook = XLSX.utils.book_new()
+  const summary = XLSX.utils.aoa_to_sheet([
+    [heading],
+    ['من تاريخ', from],
+    ['إلى تاريخ', to],
+    ['تاريخ التصدير', new Date().toLocaleString('ar-EG')],
+  ])
+  XLSX.utils.book_append_sheet(workbook, summary, 'بيانات التقرير')
+
+  tables.forEach((table, index) => {
+    const sheet = XLSX.utils.table_to_sheet(table, { raw: true })
+    const baseName = table.caption?.textContent?.trim() || `جدول ${index + 1}`
+    const sheetName = baseName.replace(/[\\\\/?*:[\\]]/g, ' ').slice(0, 25) || `جدول ${index + 1}`
+    XLSX.utils.book_append_sheet(workbook, sheet, sheetName)
+  })
+
+  const safeName = heading.replace(/[\\\\/:*?"<>|]/g, '_').slice(0, 60) || 'Report'
+  XLSX.writeFile(workbook, `${safeName}_${from}_${to}.xlsx`)
+}
 
 export function DateFilter({
   from, setFrom, to, setTo, onRun, loading, extra,
@@ -37,6 +67,10 @@ export function DateFilter({
           className="flex items-center gap-2 bg-violet-600 text-white px-4 py-1.5 rounded-lg text-sm hover:bg-violet-700 disabled:opacity-50 transition-colors">
           <RefreshCw size={13} className={loading ? 'animate-spin' : ''} />
           {loading ? 'جارٍ التحميل...' : 'عرض التقرير'}
+        </button>
+        <button onClick={() => exportVisibleReport(from, to)}
+          className="flex items-center gap-2 border border-emerald-200 text-emerald-700 px-3 py-1.5 rounded-lg text-sm hover:bg-emerald-50 transition-colors print:hidden">
+          <Download size={13} /> Excel
         </button>
         <button onClick={() => window.print()}
           className="flex items-center gap-2 border border-slate-200 text-slate-600 px-3 py-1.5 rounded-lg text-sm hover:bg-slate-50 transition-colors print:hidden">
