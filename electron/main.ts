@@ -2518,7 +2518,7 @@ function setupIpcHandlers() {
       const netDebit = row.debit - row.credit
       const netCredit = row.credit - row.debit
       if (account.type === 'revenue') totalRevenue += netCredit
-      if (account.type === 'expense' && String(account.code).startsWith('5')) cogs += netDebit
+      if (account.type === 'expense' && String(account.code).startsWith('52')) cogs += netDebit
       if (account.type === 'expense' && String(account.code).startsWith('6')) {
         const amount = netDebit
         totalExpenses += amount
