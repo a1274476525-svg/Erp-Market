@@ -2466,7 +2466,7 @@ function setupIpcHandlers() {
   ipcHandle('reports:financial', async (_, { from, to }: { from?: string; to?: string } = {}) => {
     const dateFilter: any = {}
     if (from) { const d = new Date(from); d.setUTCHours(0, 0, 0, 0); dateFilter.gte = d }
-    if (to)   { const d = new Date(to);   d.setUTCDate(d.getUTCDate() + 1); d.setUTCHours(0, 0, 0, 0); dateFilter.lte = d }
+    if (to)   { const d = new Date(to);   d.setUTCDate(d.getUTCDate() + 1); d.setUTCHours(0, 0, 0, 0); dateFilter.lt = d }
 
     const salesWhere: any  = { status: 'completed', ...(Object.keys(dateFilter).length ? { createdAt: dateFilter } : {}) }
     const purWhere: any    = Object.keys(dateFilter).length ? { invoiceDate: dateFilter } : {}
@@ -2480,47 +2480,12 @@ function setupIpcHandlers() {
       prisma.product.findMany({ where: { isActive: true } }),
     ])
 
-    // Revenue
-    const totalRevenue  = orders.reduce((s, o) => s + o.subtotal, 0)
-    const totalVatOut   = orders.reduce((s, o) => s + o.taxAmount, 0)
-    const totalReturns  = 0 // simplified
-
-    // Purchases
-    const totalPurchases   = invoices.reduce((s, i) => s + i.subtotal, 0)
-    const totalVatIn       = invoices.reduce((s, i) => s + i.taxAmount, 0)
-
-    // COGS: sum of (item.quantity * costPrice) for sold items
-    let cogs = 0
-    for (const order of orders) {
-      for (const item of order.items) {
-        cogs += item.quantity * (item.product?.costPrice ?? item.unitPrice)
-      }
-    }
-
-    // Gross Profit
-    const grossProfit = totalRevenue - cogs
-
-    // Expenses by category
-    const expByCategory: Record<string, number> = {}
-    let totalExpenses = 0
-    for (const exp of expenses) {
-      const cat = exp.category?.name ?? 'غير مصنف'
-      expByCategory[cat] = (expByCategory[cat] ?? 0) + exp.amount
-      totalExpenses += exp.amount
-    }
-
-    // Net Profit
-    const netProfit = grossProfit - totalExpenses
-
-    // Inventory value
-    const inventoryValue = products.reduce((s, p) => s + p.currentStock * p.costPrice, 0)
-
-    // Bank totals
-    const totalCash  = bankAccounts.filter(b => b.type === 'cash' || b.type === 'custody').reduce((s, b) => s + b.currentBalance, 0)
-    const totalBank  = bankAccounts.filter(b => b.type === 'bank').reduce((s, b) => s + b.currentBalance, 0)
-
-    // VAT
-    const vatNetPayable = totalVatOut - totalVatIn
+    // VAT detail is sourced from confirmed source documents; financial totals below
+    // are sourced from posted double-entry journals so returns and manual entries
+    // are included and historical COGS does not depend on today's product cost.
+    const totalVatOut = orders.reduce((s, o) => s + o.taxAmount, 0)
+    const totalPurchases = invoices.reduce((s, i) => s + i.subtotal, 0)
+    const totalVatIn = invoices.reduce((s, i) => s + i.taxAmount, 0)
 
     // Trial balance from actual posted journal entries
     const jeWhere: any = { status: 'posted' }
@@ -2538,6 +2503,37 @@ function setupIpcHandlers() {
     }
     const trialBalance = Array.from(tbMap.values())
       .sort((a, b) => a.account.code.localeCompare(b.account.code, undefined, { numeric: true }))
+
+    // Use posted ledger balances as the source of truth for financial statements.
+    // Account code 5 = cost of sales; code 6 = operating expenses.
+    let totalRevenue = 0
+    let cogs = 0
+    let totalExpenses = 0
+    const expByCategory: Record<string, number> = {}
+    let inventoryValue = 0
+    let totalCash = 0
+    let totalBank = 0
+    for (const row of trialBalance) {
+      const account = row.account
+      const netDebit = row.debit - row.credit
+      const netCredit = row.credit - row.debit
+      if (account.type === 'revenue') totalRevenue += netCredit
+      if (account.type === 'expense' && String(account.code).startsWith('5')) cogs += netDebit
+      if (account.type === 'expense' && String(account.code).startsWith('6')) {
+        const amount = netDebit
+        totalExpenses += amount
+        const category = account.name || 'مصروفات تشغيلية'
+        expByCategory[category] = (expByCategory[category] ?? 0) + amount
+      }
+      if (account.type === 'asset' && String(account.code).startsWith('113')) {
+        inventoryValue += account.normalBalance === 'credit' ? -netCredit : netDebit
+      }
+      if (account.code === '1111') totalCash += account.normalBalance === 'credit' ? -netCredit : netDebit
+      if (account.code === '1112') totalBank += account.normalBalance === 'credit' ? -netCredit : netDebit
+    }
+    const grossProfit = totalRevenue - cogs
+    const netProfit = grossProfit - totalExpenses
+    const vatNetPayable = totalVatOut - totalVatIn
 
     return {
       period: { from, to },
