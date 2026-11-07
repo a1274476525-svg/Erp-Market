@@ -55,6 +55,7 @@ export function AccountStatement() {
             { label: 'رصيد أول المدة', value: `${fmt(data.openingBalance ?? 0)} ${cur}`, color: 'slate' },
             { label: type === 'customer' ? 'إجمالي المبيعات' : 'إجمالي الفواتير', value: `${fmt(data.totalSales ?? data.totalInvoices ?? 0)} ${cur}`, color: 'blue' },
             { label: type === 'customer' ? 'إجمالي التحصيلات' : 'إجمالي المسدد', value: `${fmt(data.totalPayments ?? 0)} ${cur}`, color: 'green' },
+            ...(type === 'customer' ? [{ label: 'المرتجعات / الإشعارات الدائنة', value: `${fmt(data.totalReturns ?? 0)} ${cur}`, color: 'red' }] : []),
             { label: 'الرصيد الختامي', value: `${fmt(data.balance ?? data.total ?? 0)} ${cur}`, color: 'violet' },
           ]} />
           {!data.rows?.length ? <Empty /> : (
