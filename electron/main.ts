@@ -3171,7 +3171,7 @@ function setupIpcHandlers() {
       orderBy: { name: 'asc' },
     })
     const result = customers.map(customer => {
-      const entry: any = { id: customer.id, name: customer.name, phone: customer.phone, rows: [], total: 0, c0: 0, c30: 0, c60: 0, c90: 0, count: 0, oldestDueDate: null as Date | null }
+      const entry: any = { id: customer.id, name: customer.name, phone: customer.phone, rows: [], total: 0, c0: 0, c30: 0, c60: 0, c90: 0, count: 0, oldestDueDate: null as Date | null, lastDate: null as Date | null, lastDate: null as Date | null }
       for (const order of customer.orders) {
         const paid = order.payments.reduce((sum, payment) => sum + payment.amount, 0)
         const returned = order.returns.reduce((sum, ret) => {
@@ -3186,13 +3186,13 @@ function setupIpcHandlers() {
         entry.total += due
         entry.count++
         if (!entry.oldestDueDate || new Date(order.createdAt) < entry.oldestDueDate) entry.oldestDueDate = new Date(order.createdAt)
+        if (!entry.lastDate || new Date(order.createdAt) > entry.lastDate) entry.lastDate = new Date(order.createdAt)
         if      (days <= 30) entry.c0  += due
         else if (days <= 60) entry.c30 += due
         else if (days <= 90) entry.c60 += due
         else                 entry.c90 += due
       }
       entry.days = entry.oldestDueDate ? Math.max(0, Math.floor((cutoff.getTime() - 1 - entry.oldestDueDate.getTime()) / 86400000)) : 0
-      entry.lastDate = entry.oldestDueDate
       return entry
     }).filter(entry => entry.total > 0.005)
     return result.sort((a, b) => b.total - a.total)
@@ -3231,6 +3231,7 @@ function setupIpcHandlers() {
       entry.total += due
       entry.count++
       if (!entry.oldestDueDate || new Date(invoice.invoiceDate) < entry.oldestDueDate) entry.oldestDueDate = new Date(invoice.invoiceDate)
+      if (!entry.lastDate || new Date(invoice.invoiceDate) > entry.lastDate) entry.lastDate = new Date(invoice.invoiceDate)
       if      (days <= 30) entry.c0  += due
       else if (days <= 60) entry.c30 += due
       else if (days <= 90) entry.c60 += due
@@ -3240,7 +3241,6 @@ function setupIpcHandlers() {
       .filter(entry => entry.total > 0.005)
       .map(entry => ({
         ...entry,
-        lastDate: entry.oldestDueDate,
         days: entry.oldestDueDate ? Math.max(0, Math.floor((cutoff.getTime() - 1 - entry.oldestDueDate.getTime()) / 86400000)) : 0,
       }))
       .sort((a, b) => b.total - a.total)
