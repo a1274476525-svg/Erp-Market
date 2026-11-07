@@ -3290,7 +3290,7 @@ function setupIpcHandlers() {
         await tx.purchaseInvoice.deleteMany({})
         await tx.purchaseRequestItem.deleteMany({})
         await tx.purchaseRequest.deleteMany({})
-        await tx.stockMovement.deleteMany({ where: { type: 'purchase' } })
+        await tx.stockMovement.deleteMany({ where: { type: { in: ['purchase', 'purchase_return'] } } })
         await tx.journalEntry.deleteMany({ where: { source: 'purchase' } })
       }
 
