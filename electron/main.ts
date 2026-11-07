@@ -3158,7 +3158,7 @@ function setupIpcHandlers() {
         }, 0)
         const due = Math.max(0, order.total - paid - returned)
         if (due <= 0.005) continue
-        const days = Math.max(0, Math.floor((cutoff.getTime() - new Date(order.createdAt).getTime()) / 86400000) - 1)
+        const days = Math.max(0, Math.floor((cutoff.getTime() - 1 - new Date(order.createdAt).getTime()) / 86400000))
         const row = { orderId: order.id, orderNumber: order.orderNumber, date: order.createdAt, total: order.total, paid, returned, due, days }
         entry.rows.push(row)
         entry.total += due
@@ -3169,7 +3169,7 @@ function setupIpcHandlers() {
         else if (days <= 90) entry.c60 += due
         else                 entry.c90 += due
       }
-      entry.days = entry.oldestDueDate ? Math.max(0, Math.floor((cutoff.getTime() - entry.oldestDueDate.getTime()) / 86400000) - 1) : 0
+      entry.days = entry.oldestDueDate ? Math.max(0, Math.floor((cutoff.getTime() - 1 - entry.oldestDueDate.getTime()) / 86400000)) : 0
       entry.lastDate = entry.oldestDueDate
       return entry
     }).filter(entry => entry.total > 0.005)
@@ -3200,7 +3200,7 @@ function setupIpcHandlers() {
       }, 0)
       const due = Math.max(0, invoice.total - paid - returned)
       if (due <= 0.005) continue
-      const days = Math.max(0, Math.floor((cutoff.getTime() - new Date(invoice.invoiceDate).getTime()) / 86400000) - 1)
+      const days = Math.max(0, Math.floor((cutoff.getTime() - 1 - new Date(invoice.invoiceDate).getTime()) / 86400000))
       entry.rows.push({
         invoiceId: invoice.id, invoiceNumber: invoice.invoiceNumber ?? `INV-${invoice.id}`,
         date: invoice.invoiceDate, total: invoice.total, paid, returned, due, days,
