@@ -3139,6 +3139,8 @@ function setupIpcHandlers() {
         await tx.saleReturn.deleteMany({})
       }
       if (removeSales) {
+        await tx.customerPayment.deleteMany({})
+        await tx.journalEntry.deleteMany({ where: { source: 'customer_payment' } })
         await tx.posOrderItem.deleteMany({})
         await tx.posOrder.deleteMany({})
         await tx.journalEntry.deleteMany({ where: { source: 'sale' } })
@@ -3150,6 +3152,8 @@ function setupIpcHandlers() {
       }
 
       if (removePurchases) {
+        await tx.supplierPayment.deleteMany({})
+        await tx.journalEntry.deleteMany({ where: { source: 'supplier_payment' } })
         await tx.purchaseItem.deleteMany({})
         await tx.purchaseInvoice.deleteMany({})
         await tx.purchaseRequestItem.deleteMany({})
@@ -3190,15 +3194,17 @@ function setupIpcHandlers() {
       }
 
       if (all || selected.has('customers')) {
-        // Preserve sales documents when only the customer master data is cleared.
+        // Preserve historical receipts and sales while detaching the optional customer master record.
         await tx.posOrder.updateMany({ data: { customerId: null } })
+        await tx.customerPayment.updateMany({ data: { customerId: null } })
         await tx.customer.deleteMany({})
       }
 
       if (all || selected.has('suppliers')) {
-        // Supplier references are optional; detach them before removing suppliers.
+        // Supplier references are optional; preserve payment history and detach supplier master records.
         await tx.purchaseInvoice.updateMany({ data: { supplierId: null } })
         await tx.purchaseRequest.updateMany({ data: { supplierId: null } })
+        await tx.supplierPayment.updateMany({ data: { supplierId: null } })
         await tx.supplier.deleteMany({})
       }
 
