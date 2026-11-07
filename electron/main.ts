@@ -824,7 +824,7 @@ function setupIpcHandlers() {
   )
 
   ipcHandle('pos:voidOrder', async (_, id: number) => {
-    const order = await prisma.$transaction(async (tx) => {
+    return prisma.$transaction(async (tx) => {
       const current = await tx.posOrder.findUnique({
         where: { id },
         include: { items: true, returns: true },
@@ -832,6 +832,14 @@ function setupIpcHandlers() {
       if (!current) throw new Error('الفاتورة غير موجودة')
       if (current.status !== 'completed') throw new Error('الفاتورة ملغاة بالفعل')
       if (current.returns.length > 0) throw new Error('لا يمكن إلغاء فاتورة لها مرتجعات مسجلة')
+
+      const originalEntries = await tx.journalEntry.findMany({
+        where: { source: 'sale', sourceId: id, status: 'posted' },
+        include: { lines: true },
+      })
+      if (originalEntries.length === 0) {
+        throw new Error('لا يمكن إلغاء الفاتورة لأن قيودها المحاسبية الأصلية غير موجودة')
+      }
 
       const o = await tx.posOrder.update({
         where: { id },
@@ -845,39 +853,37 @@ function setupIpcHandlers() {
           data: { productId: item.productId, quantity: item.quantity, type: 'return', referenceId: o.id, note: `إلغاء ${o.orderNumber}` },
         })
       }
-      return o
-    })
 
-    try {
-      const origJEs = await prisma.journalEntry.findMany({
-        where: { source: 'sale', sourceId: id, status: 'posted' },
-        include: { lines: true },
-      })
-      for (const je of origJEs) {
-        const number = await nextJENumber()
-        await prisma.journalEntry.create({
+      // Reverse every original sale posting in the same transaction as the void and stock restoration.
+      for (const je of originalEntries) {
+        const reversalDescription = `إلغاء: ${je.description ?? je.number}`
+        const existingReversal = await tx.journalEntry.findFirst({
+          where: { source: 'sale', sourceId: id, reference: je.number, description: reversalDescription, status: 'posted' },
+        })
+        if (existingReversal) continue
+        const number = await nextJENumber(tx)
+        await tx.journalEntry.create({
           data: {
-            number, date: new Date(), status: 'posted',
-            description: `إلغاء: ${je.description ?? je.number}`,
+            number,
+            date: new Date(),
+            status: 'posted',
+            description: reversalDescription,
             reference: je.number,
             source: 'sale',
             sourceId: id,
             lines: {
-              create: je.lines.map(l => ({
-                accountId: l.accountId,
-                debit: l.credit,
-                credit: l.debit,
-                description: l.description,
+              create: je.lines.map(line => ({
+                accountId: line.accountId,
+                debit: line.credit,
+                credit: line.debit,
+                description: line.description,
               })),
             },
           },
         })
       }
-    } catch (e) {
-      console.error('[AutoJE:voidOrder]', e)
-    }
-
-    return order
+      return o
+    })
   })
 
   ipcHandle('pos:createReturn', async (_, { orderId, items, reason }) => {
