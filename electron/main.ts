@@ -928,47 +928,46 @@ function setupIpcHandlers() {
           data: { productId: item.productId, quantity: item.quantity, type: 'return', referenceId: r.id },
         })
       }
-      return r
-    })
 
-    try {
-      const [salesAcc, cashAcc, cogsAcc, invAcc] = await Promise.all([
-        findAccByCode('4111'), findAccByCode('1111'),
-        findAccByCode('521'), findAccByCode('1131'),
+      await ensureStandardAccounts(tx)
+      const [salesAcc, cashAcc, bankAcc, cogsAcc, invAcc] = await Promise.all([
+        findAccByCode('4111', tx), findAccByCode('1111', tx), findAccByCode('1112', tx),
+        findAccByCode('521', tx), findAccByCode('1131', tx),
       ])
-      if (salesAcc && cashAcc) {
+      const refundAcc = order.paymentMethod === 'cash' ? cashAcc : bankAcc
+      if (!salesAcc || !refundAcc || !cogsAcc || !invAcc) {
+        throw new Error('تعذر إيجاد حسابات مرتجع المبيعات والنقدية/البنك والمخزون والتكلفة')
+      }
+      await autoJE({
+        date: new Date(r.returnDate),
+        description: `مرتجع مبيعات - RTN-${r.id}`,
+        reference: `RTN-${r.id}`,
+        source: 'sale',
+        sourceId: r.id,
+        lines: [
+          { accountId: salesAcc.id, debit: r.total, credit: 0, description: 'مرتجع مبيعات' },
+          { accountId: refundAcc.id, debit: 0, credit: r.total, description: 'رد قيمة المرتجع' },
+        ],
+        db: tx,
+      })
+      // Restore inventory at the original sale-time cost, in the same transaction.
+      const cost = r.items.reduce((sum, item) => sum + item.quantity * item.unitCost, 0)
+      if (cost > 0) {
         await autoJE({
-          date: new Date(ret.returnDate),
-          description: `مرتجع مبيعات - RTN-${ret.id}`,
-          reference: `RTN-${ret.id}`,
+          date: new Date(r.returnDate),
+          description: `إعادة تكلفة مرتجع - RTN-${r.id}`,
+          reference: `RTN-${r.id}`,
           source: 'sale',
-          sourceId: ret.id,
+          sourceId: r.id,
           lines: [
-            { accountId: salesAcc.id, debit: ret.total, credit: 0, description: 'مرتجع مبيعات' },
-            { accountId: cashAcc.id, debit: 0, credit: ret.total, description: 'استرداد نقدي' },
+            { accountId: invAcc.id, debit: cost, credit: 0, description: 'إعادة مخزون' },
+            { accountId: cogsAcc.id, debit: 0, credit: cost, description: 'عكس تكلفة' },
           ],
+          db: tx,
         })
       }
-      if (cogsAcc && invAcc) {
-        // Restore inventory at the cost recorded on the original sale lines.
-        const cost = ret.items.reduce((sum, item) => sum + item.quantity * item.unitCost, 0)
-        if (cost > 0) {
-          await autoJE({
-            date: new Date(ret.returnDate),
-            description: `إعادة تكلفة مرتجع - RTN-${ret.id}`,
-            reference: `RTN-${ret.id}`,
-            source: 'sale',
-            sourceId: ret.id,
-            lines: [
-              { accountId: invAcc.id, debit: cost, credit: 0, description: 'إعادة مخزون' },
-              { accountId: cogsAcc.id, debit: 0, credit: cost, description: 'عكس تكلفة' },
-            ],
-          })
-        }
-      }
-    } catch (e) {
-      console.error('[AutoJE:return]', e)
-    }
+      return r
+    })
 
     return ret
   })
