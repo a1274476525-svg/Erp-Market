@@ -62,7 +62,11 @@ export default function SettlementsPage() {
     return invoices.filter(i => i.status === 'confirmed' && i.supplierId)
       .map(i => {
         const paid = (i.payments ?? []).reduce((sum: number, p: any) => sum + Number(p.amount || 0), 0)
-        return { id: i.id, label: i.invoiceNumber || `INV-${i.id}`, party: i.supplier?.name || 'مورد', date: i.invoiceDate, total: i.total, paid, due: Math.max(0, i.total - paid) }
+        const returned = (i.returns ?? []).reduce((sum: number, ret: any) => {
+          const taxShare = i.subtotal > 0 ? Number(i.taxAmount || 0) * Number(ret.total || 0) / i.subtotal : 0
+          return sum + Number(ret.total || 0) + taxShare
+        }, 0)
+        return { id: i.id, label: i.invoiceNumber || `INV-${i.id}`, party: i.supplier?.name || 'مورد', date: i.invoiceDate, total: i.total, paid, returned, due: Math.max(0, i.total - paid - returned) }
       }).filter(i => i.due > 0.005)
   }, [mode, orders, invoices])
 
