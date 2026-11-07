@@ -1696,6 +1696,9 @@ function setupIpcHandlers() {
   })
 
   ipcHandle('expenses:create', async (_, data) => {
+    const amount = Number(data?.amount)
+    if (!Number.isFinite(amount) || amount <= 0) throw new Error('يجب إدخال مبلغ مصروف أكبر من صفر')
+    if (!Number.isInteger(data?.categoryId) || data.categoryId <= 0) throw new Error('اختر نوع المصروف')
     const expense = await prisma.expense.create({ data, include: { category: true } })
 
     try {
@@ -1703,20 +1706,44 @@ function setupIpcHandlers() {
         { id: expense.id, amount: expense.amount, description: expense.description, date: data.date || new Date(), categoryName: expense.category?.name },
         data.paymentMethod,
       )
-    } catch (e) {
-      console.error('[AutoJE:expense]', e)
+    } catch (error) {
+      // Never leave an expense saved without its corresponding ledger posting.
+      // The automatic journal entry is created atomically with its lines, so a
+      // failed posting can be safely compensated by removing this new document.
+      await prisma.expense.delete({ where: { id: expense.id } })
+      console.error('[AutoJE:expense]', error)
+      throw new Error('لم يتم حفظ المصروف لأن ترحيله المحاسبي فشل: ' + (error instanceof Error ? error.message : String(error)))
     }
 
     return expense
   })
 
-  ipcHandle('expenses:update', (_, { id, ...data }) =>
-    prisma.expense.update({ where: { id }, data, include: { category: true } })
-  )
+  ipcHandle('expenses:update', async (_, { id, ...data }) => {
+    const existing = await prisma.expense.findUnique({ where: { id } })
+    if (!existing) throw new Error('المصروف غير موجود')
+    const postedEntries = await prisma.journalEntry.count({
+      where: { source: 'expense', sourceId: id, status: 'posted' },
+    })
+    if (postedEntries > 0) {
+      throw new Error('لا يمكن تعديل مصروف مرحّل قبل تنفيذ عكس محاسبي موثّق. لم يتم تغيير المصروف.')
+    }
+    if (data.amount !== undefined && (!Number.isFinite(Number(data.amount)) || Number(data.amount) <= 0)) {
+      throw new Error('يجب إدخال مبلغ مصروف أكبر من صفر')
+    }
+    return prisma.expense.update({ where: { id }, data, include: { category: true } })
+  })
 
-  ipcHandle('expenses:delete', (_, id: number) =>
-    prisma.expense.delete({ where: { id } })
-  )
+  ipcHandle('expenses:delete', async (_, id: number) => {
+    const existing = await prisma.expense.findUnique({ where: { id } })
+    if (!existing) throw new Error('المصروف غير موجود')
+    const postedEntries = await prisma.journalEntry.count({
+      where: { source: 'expense', sourceId: id, status: 'posted' },
+    })
+    if (postedEntries > 0) {
+      throw new Error('لا يمكن حذف مصروف مرحّل قبل تنفيذ عكس محاسبي موثّق. لم يتم حذف المصروف.')
+    }
+    return prisma.expense.delete({ where: { id } })
+  })
 
   // ─── CHART OF ACCOUNTS ────────────────────────────────────────
   ipcHandle('accounts:getAll', () =>
