@@ -1804,7 +1804,7 @@ function setupIpcHandlers() {
     const created: Record<string, number> = {}
     for (const acc of STANDARD_ACCOUNTS) {
       const parentId = acc.p ? created[acc.p] : null
-      const record = await db.account.create({
+      const record = await prisma.account.create({
         data: { code: acc.code, name: acc.name, type: acc.type, normalBalance: acc.nb, level: acc.level, parentId },
       })
       created[acc.code] = record.id
