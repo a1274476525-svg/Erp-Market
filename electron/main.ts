@@ -1803,7 +1803,7 @@ function setupIpcHandlers() {
     const created: Record<string, number> = {}
     for (const acc of STANDARD_ACCOUNTS) {
       const parentId = acc.p ? created[acc.p] : null
-      const record = await prisma.account.create({
+      const record = await db.account.create({
         data: { code: acc.code, name: acc.name, type: acc.type, normalBalance: acc.nb, level: acc.level, parentId },
       })
       created[acc.code] = record.id
@@ -1812,19 +1812,21 @@ function setupIpcHandlers() {
   })
 
   // ─── JOURNAL ENTRY HELPERS ────────────────────────────────────
-  async function nextJENumber() {
-    const latest = await prisma.journalEntry.aggregate({ _max: { id: true } })
+  type AccountingDb = PrismaClient | Prisma.TransactionClient
+
+  async function nextJENumber(db: AccountingDb = prisma) {
+    const latest = await db.journalEntry.aggregate({ _max: { id: true } })
     let sequence = (latest._max.id ?? 0) + 1
     let number = `JE-${String(sequence).padStart(5, '0')}`
-    while (await prisma.journalEntry.findUnique({ where: { number } })) {
+    while (await db.journalEntry.findUnique({ where: { number } })) {
       sequence++
       number = `JE-${String(sequence).padStart(5, '0')}`
     }
     return number
   }
 
-  async function findAccByCode(code: string) {
-    return prisma.account.findUnique({ where: { code } })
+  async function findAccByCode(code: string, db: AccountingDb = prisma) {
+    return db.account.findUnique({ where: { code } })
   }
 
   async function autoJE(opts: {
@@ -1834,8 +1836,10 @@ function setupIpcHandlers() {
     source: string
     sourceId: number
     lines: { accountId: number; debit: number; credit: number; description?: string }[]
+    db?: AccountingDb
   }) {
     const { date, description, reference, source, sourceId, lines } = opts
+    const db = opts.db ?? prisma
     if (lines.length < 2) throw new Error('القيد الآلي يجب أن يحتوي على سطرين على الأقل')
     for (const line of lines) {
       if (!Number.isFinite(line.debit) || !Number.isFinite(line.credit) || line.debit < 0 || line.credit < 0 || (line.debit > 0 && line.credit > 0)) {
@@ -1850,12 +1854,12 @@ function setupIpcHandlers() {
     // A source document may legitimately create multiple entries (e.g. sales
     // revenue and COGS); the description distinguishes each posting. Return an
     // existing matching entry on retries instead of duplicating it.
-    const existing = await prisma.journalEntry.findFirst({
+    const existing = await db.journalEntry.findFirst({
       where: { source, sourceId, description, status: 'posted' },
     })
     if (existing) return existing
-    const number = await nextJENumber()
-    return prisma.journalEntry.create({
+    const number = await nextJENumber(db)
+    return db.journalEntry.create({
       data: {
         number, date, description,
         reference: reference ?? null,
@@ -1878,8 +1882,8 @@ function setupIpcHandlers() {
   // preserving any existing (custom or already-seeded) accounts and links.
   // Called before every auto-posting attempt so a sale/purchase/expense can
   // never silently skip its journal entry for lack of a chart-of-accounts code.
-  async function ensureStandardAccounts() {
-    const existing = await prisma.account.findMany({ select: { id: true, code: true } })
+  async function ensureStandardAccounts(db: AccountingDb = prisma) {
+    const existing = await db.account.findMany({ select: { id: true, code: true } })
     const idByCode = new Map(existing.map(a => [a.code, a.id]))
     for (const acc of STANDARD_ACCOUNTS) {
       if (idByCode.has(acc.code)) continue
@@ -1892,10 +1896,10 @@ function setupIpcHandlers() {
   }
 
   // ─── AUTOMATIC POSTING (shared by create + confirm-draft + backfill) ──
-  async function postPurchaseInvoiceJE(invoice: { id: number; invoiceDate: Date; subtotal: number; taxAmount: number; total: number; invoiceNumber: string | null }) {
-    await ensureStandardAccounts()
+  async function postPurchaseInvoiceJE(invoice: { id: number; invoiceDate: Date; subtotal: number; taxAmount: number; total: number; invoiceNumber: string | null }, db: AccountingDb = prisma) {
+    await ensureStandardAccounts(db)
     const [invAcc, payAcc, vatAcc] = await Promise.all([
-      findAccByCode('1131'), findAccByCode('2111'), findAccByCode('2121'),
+      findAccByCode('1131', db), findAccByCode('2111', db), findAccByCode('2121', db),
     ])
     if (!invAcc || !payAcc) throw new Error('تعذر إيجاد حسابات المخزون/الموردين في دليل الحسابات')
     const jeLines: { accountId: number; debit: number; credit: number; description?: string }[] = []
@@ -1913,15 +1917,16 @@ function setupIpcHandlers() {
       source: 'purchase',
       sourceId: invoice.id,
       lines: jeLines,
+      db,
     })
   }
 
-  async function postSaleJE(order: { id: number; orderNumber: string; createdAt: Date; total: number; subtotal: number; discountAmount: number; taxAmount: number; paymentMethod: string; items: { productId: number; quantity: number }[] }) {
-    await ensureStandardAccounts()
+  async function postSaleJE(order: { id: number; orderNumber: string; createdAt: Date; total: number; subtotal: number; discountAmount: number; taxAmount: number; paymentMethod: string; items: { productId: number; quantity: number; unitCost: number }[] }, db: AccountingDb = prisma) {
+    await ensureStandardAccounts(db)
     const [cashAcc, bankAcc, salesAcc, vatAcc, cogsAcc, invAcc] = await Promise.all([
-      findAccByCode('1111'), findAccByCode('1112'),
-      findAccByCode('4111'), findAccByCode('2121'),
-      findAccByCode('521'),  findAccByCode('1131'),
+      findAccByCode('1111', db), findAccByCode('1112', db),
+      findAccByCode('4111', db), findAccByCode('2121', db),
+      findAccByCode('521', db),  findAccByCode('1131', db),
     ])
     const drAcc = order.paymentMethod === 'cash' ? cashAcc : bankAcc
     if (!drAcc || !salesAcc) throw new Error('تعذر إيجاد حسابات النقدية/المبيعات في دليل الحسابات')
@@ -1947,6 +1952,7 @@ function setupIpcHandlers() {
       source: 'sale',
       sourceId: order.id,
       lines: salesLines,
+      db,
     })
 
     if (!cogsAcc || !invAcc) throw new Error('تعذر إيجاد حسابات تكلفة/مخزون البضاعة في دليل الحسابات')
@@ -1964,14 +1970,15 @@ function setupIpcHandlers() {
           { accountId: cogsAcc.id, debit: cogs, credit: 0,    description: 'تكلفة بضاعة مباعة' },
           { accountId: invAcc.id,  debit: 0,    credit: cogs, description: 'خروج مخزون' },
         ],
+        db,
       })
     }
   }
 
-  async function postExpenseJE(expense: { id: number; amount: number; description: string | null; date: Date; categoryName?: string | null }, paymentMethod?: string | null) {
-    await ensureStandardAccounts()
+  async function postExpenseJE(expense: { id: number; amount: number; description: string | null; date: Date; categoryName?: string | null }, paymentMethod?: string | null, db: AccountingDb = prisma) {
+    await ensureStandardAccounts(db)
     const [expAcc, cashAcc, bankAcc] = await Promise.all([
-      findAccByCode('61'), findAccByCode('1111'), findAccByCode('1112'),
+      findAccByCode('61', db), findAccByCode('1111', db), findAccByCode('1112', db),
     ])
     const crAcc = (!paymentMethod || paymentMethod === 'cash') ? cashAcc : bankAcc
     if (!expAcc || !crAcc) throw new Error('تعذر إيجاد حسابات المصاريف/النقدية في دليل الحسابات')
@@ -1985,6 +1992,7 @@ function setupIpcHandlers() {
         { accountId: expAcc.id, debit: expense.amount, credit: 0,              description: desc || undefined },
         { accountId: crAcc.id,  debit: 0,              credit: expense.amount, description: 'صرف نقدي' },
       ],
+      db,
     })
   }
 
