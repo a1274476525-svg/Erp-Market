@@ -2760,24 +2760,41 @@ function setupIpcHandlers() {
     }
     const start = dateRange(from)
     const end = dateRange(to, true)
-    const orderWhere: any = { customerId: id, status: 'completed' }
+    const orderWhere: any = { customerId: id, status: 'completed', paymentMethod: 'credit' }
     const paymentWhere: any = { customerId: id }
-    if (start) { orderWhere.createdAt = { gte: start, ...(end ? { lt: end } : {}) }; paymentWhere.date = { gte: start, ...(end ? { lt: end } : {}) } }
-    else if (end) { orderWhere.createdAt = { lt: end }; paymentWhere.date = { lt: end } }
-    const openingWhereOrders: any = { customerId: id, status: 'completed', ...(start ? { createdAt: { lt: start } } : { id: -1 }) }
+    const returnWhere: any = { order: { customerId: id, paymentMethod: 'credit', status: 'completed' } }
+    if (start) {
+      orderWhere.createdAt = { gte: start, ...(end ? { lt: end } : {}) }
+      paymentWhere.date = { gte: start, ...(end ? { lt: end } : {}) }
+      returnWhere.returnDate = { gte: start, ...(end ? { lt: end } : {}) }
+    } else if (end) {
+      orderWhere.createdAt = { lt: end }
+      paymentWhere.date = { lt: end }
+      returnWhere.returnDate = { lt: end }
+    }
+    const openingWhereOrders: any = { customerId: id, status: 'completed', paymentMethod: 'credit', ...(start ? { createdAt: { lt: start } } : { id: -1 }) }
     const openingWherePayments: any = { customerId: id, ...(start ? { date: { lt: start } } : { id: -1 }) }
-    const [orders, payments, customer, openingOrders, openingPayments] = await Promise.all([
+    const openingWhereReturns: any = { order: { customerId: id, paymentMethod: 'credit', status: 'completed' }, ...(start ? { returnDate: { lt: start } } : { id: -1 }) }
+    const [orders, payments, returns, customer, openingOrders, openingPayments, openingReturns] = await Promise.all([
       prisma.posOrder.findMany({ where: orderWhere, orderBy: { createdAt: 'asc' } }),
       prisma.customerPayment.findMany({ where: paymentWhere, orderBy: { date: 'asc' }, include: { order: true } }),
+      prisma.saleReturn.findMany({ where: returnWhere, orderBy: { returnDate: 'asc' }, include: { order: true } }),
       prisma.customer.findUnique({ where: { id } }),
       prisma.posOrder.aggregate({ where: openingWhereOrders, _sum: { total: true } }),
       prisma.customerPayment.aggregate({ where: openingWherePayments, _sum: { amount: true } }),
+      prisma.saleReturn.findMany({ where: openingWhereReturns, include: { order: true } }),
     ])
     if (!customer) throw new Error('العميل غير موجود')
-    const openingBalance = (openingOrders._sum.total ?? 0) - (openingPayments._sum.amount ?? 0)
+    const returnValue = (ret: any) => {
+      const ratio = ret.order.subtotal > 0 ? ret.total / ret.order.subtotal : 0
+      return Math.max(0, ret.total - (ret.order.discountAmount ?? 0) * ratio + (ret.order.taxAmount ?? 0) * ratio)
+    }
+    const openingReturnTotal = openingReturns.reduce((sum: number, ret: any) => sum + returnValue(ret), 0)
+    const openingBalance = (openingOrders._sum.total ?? 0) - (openingPayments._sum.amount ?? 0) - openingReturnTotal
     const events = [
-      ...orders.map(o => ({ date: o.createdAt, description: `فاتورة مبيعات ${o.orderNumber}`, amount: o.total, debit: o.total, credit: 0, kind: 'sale' })),
+      ...orders.map(o => ({ date: o.createdAt, description: `فاتورة مبيعات آجلة ${o.orderNumber}`, amount: o.total, debit: o.total, credit: 0, kind: 'sale' })),
       ...payments.map(p => ({ date: p.date, description: `تحصيل على ${p.order.orderNumber}${p.reference ? ` - ${p.reference}` : ''}`, amount: -p.amount, debit: 0, credit: p.amount, kind: 'receipt' })),
+      ...returns.map(ret => { const value = returnValue(ret); return { date: ret.returnDate, description: `إشعار دائن / مرتجع ${ret.id}`, amount: -value, debit: 0, credit: value, kind: 'return' } }),
     ].sort((x, y) => new Date(x.date).getTime() - new Date(y.date).getTime())
     let balance = openingBalance
     const rows = events.map(event => {
@@ -2786,7 +2803,8 @@ function setupIpcHandlers() {
     })
     const totalSales = orders.reduce((sum, o) => sum + o.total, 0)
     const totalPayments = payments.reduce((sum, p) => sum + p.amount, 0)
-    return { customer, rows, openingBalance, total: balance, balance, totalSales, totalPayments, count: rows.length }
+    const totalReturns = returns.reduce((sum, ret) => sum + returnValue(ret), 0)
+    return { customer, rows, openingBalance, total: balance, balance, totalSales, totalPayments, totalReturns, count: rows.length }
   })
 
   ipcHandle('reports:supplierStatement', async (_, { supplierId, from, to }: any = {}) => {
