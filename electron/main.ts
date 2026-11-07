@@ -286,6 +286,7 @@ function setupIpcHandlers() {
     'voidOrder', 'createReturn', 'saveDraft', 'updateDraft', 'deleteDraft', 'confirmDraft',
     'updateStatus', 'execute', 'close', 'removeItem', 'updateItem', 'post', 'reverse',
     'backfillMissing', 'seedDefault', 'setDefault', 'syncStock', 'set', 'log', 'ignore',
+    'receivePayment', 'payInvoice',
     'unmatch', 'import', 'match', 'createFromLine', 'applyRules', 'selectImage', 'removeImage',
     'selectFolder', 'clearAllData', 'parseFile',
   ])
@@ -293,6 +294,8 @@ function setupIpcHandlers() {
     const [group, action] = channel.split(':')
     if (group === 'pos' && action === 'voidOrder') return ['/sales', '/pos']
     if (group === 'pos' && action === 'createReturn') return ['/returns', '/pos']
+    if (group === 'customers' && ['getPayments', 'receivePayment'].includes(action)) return ['/settlements', '/customers']
+    if (group === 'suppliers' && ['getPayments', 'payInvoice'].includes(action)) return ['/settlements', '/suppliers']
     if (group === 'stock' && action === 'waste') return ['/waste', '/stock']
     const paths: Record<string, string[]> = {
       products: ['/products'], productBarcodes: ['/products'], productUnits: ['/products'],
