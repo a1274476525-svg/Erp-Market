@@ -1933,7 +1933,7 @@ function setupIpcHandlers() {
 
   ipcHandle('expenseCategories:getAccounts', () =>
     prisma.account.findMany({
-      where: { type: 'expense', isActive: true, children: { none: {} } },
+      where: { type: 'expense', isActive: true, code: { startsWith: '6' }, children: { none: {} } },
       select: { id: true, code: true, name: true },
       orderBy: { code: 'asc' },
     })
