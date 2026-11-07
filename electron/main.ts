@@ -863,7 +863,7 @@ function setupIpcHandlers() {
       })
 
       const warehouse = await getDefaultWarehouse(tx)
-      const itemsWithCost = []
+      const itemsWithCost: { productId: number; productName: string; quantity: number; unitPrice: number; unitCost: number; total: number }[] = []
       for (const item of normalizedItems) {
         const product = await tx.product.findUnique({ where: { id: item.productId }, select: { name: true, costPrice: true } })
         if (!product) throw new Error('المنتج غير موجود')
@@ -882,7 +882,7 @@ function setupIpcHandlers() {
       const supplierCredit = Math.round((subtotal + taxShare) * 100) / 100
       const inventoryCost = Math.round(itemsWithCost.reduce((sum, item) => sum + item.quantity * item.unitCost, 0) * 100) / 100
       const variance = Math.round((subtotal - inventoryCost) * 100) / 100
-      if (!Number.isFinite(supplierCredit) || supplierCredit <= 0 || !Number.isFinite(inventoryCost) || inventoryCost <= 0) {
+      if (!Number.isFinite(supplierCredit) || supplierCredit <= 0 || !Number.isFinite(inventoryCost) || inventoryCost < 0) {
         throw new Error('تعذر حساب قيمة مرتجع المورد')
       }
 
@@ -3267,7 +3267,9 @@ function setupIpcHandlers() {
 
       if (removePurchases) {
         await tx.supplierPayment.deleteMany({})
-        await tx.journalEntry.deleteMany({ where: { source: 'supplier_payment' } })
+        await tx.journalEntry.deleteMany({ where: { source: { in: ['supplier_payment', 'purchase_return'] } } })
+        await tx.purchaseReturnItem.deleteMany({})
+        await tx.purchaseReturn.deleteMany({})
         await tx.purchaseItem.deleteMany({})
         await tx.purchaseInvoice.deleteMany({})
         await tx.purchaseRequestItem.deleteMany({})
