@@ -15,6 +15,21 @@ interface FinancialData {
   inventory: { value: number }
   banks: { cash: number; bank: number; accounts: any[] }
   trialBalance: { code: string; name: string; type: string; debit: number; credit: number }[]
+  balanceSheet: {
+    asOf: string
+    assets: { id: number; code: string; name: string; balance: number }[]
+    liabilities: { id: number; code: string; name: string; balance: number }[]
+    equity: { id: number; code: string; name: string; balance: number }[]
+    currentEarnings: number
+    assetsTotal: number
+    liabilitiesTotal: number
+    equityTotal: number
+    liabilitiesAndEquity: number
+    difference: number
+    isBalanced: boolean
+    receivables: number
+    payables: number
+  }
   ordersCount: number
   invoicesCount: number
 }
@@ -97,14 +112,20 @@ export default function FinancialReports() {
       rows.push(['إجمالي المصروفات', -data.expenses.total])
       rows.push(['صافي الربح / الخسارة', data.netProfit])
     } else if (tab === 'balance') {
-      rows.push(['البند', 'القيمة'])
-      rows.push(['المخزون', data.inventory.value])
-      rows.push(['الصناديق والعهد', data.banks.cash])
-      rows.push(['البنوك', data.banks.bank])
-      rows.push(['إجمالي الأصول المعروضة', data.inventory.value + data.banks.cash + data.banks.bank])
-      rows.push(['ضريبة القيمة المضافة المستحقة', Math.max(data.vat.net, 0)])
-      rows.push(['صافي ربح / خسارة الفترة', data.netProfit])
-      rows.push(['إجمالي الخصوم وحقوق الملكية المعروضة', Math.max(data.vat.net, 0) + data.netProfit])
+      rows.push(['الأصول', 'القيمة'])
+      data.balanceSheet.assets.forEach(account => rows.push([account.code + ' — ' + account.name, account.balance]))
+      rows.push(['إجمالي الأصول', data.balanceSheet.assetsTotal])
+      rows.push([])
+      rows.push(['الخصوم', 'القيمة'])
+      data.balanceSheet.liabilities.forEach(account => rows.push([account.code + ' — ' + account.name, account.balance]))
+      rows.push(['إجمالي الخصوم', data.balanceSheet.liabilitiesTotal])
+      rows.push([])
+      rows.push(['حقوق الملكية', 'القيمة'])
+      data.balanceSheet.equity.forEach(account => rows.push([account.code + ' — ' + account.name, account.balance]))
+      rows.push(['الأرباح المتراكمة غير المقفلة', data.balanceSheet.currentEarnings])
+      rows.push(['إجمالي حقوق الملكية', data.balanceSheet.equityTotal])
+      rows.push(['إجمالي الخصوم وحقوق الملكية', data.balanceSheet.liabilitiesAndEquity])
+      rows.push(['فرق الموازنة', data.balanceSheet.difference])
     } else if (tab === 'trial') {
       rows.push(['كود الحساب', 'الحساب', 'النوع', 'مدين', 'دائن'])
       data.trialBalance.forEach(row => rows.push([row.code, row.name, row.type, row.debit, row.credit]))
@@ -196,28 +217,31 @@ export default function FinancialReports() {
 
           {/* Balance Sheet */}
           {tab === 'balance' && (
-            <div className="grid grid-cols-2 gap-4">
-              {/* Assets */}
-              <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-                <div className="px-4 py-3 bg-blue-700 text-white text-sm font-semibold">الأصول</div>
-                <Row label="المخزون (قيمة دفترية)" value={data.inventory.value} currency={cur} indent={1} />
-                <Row label="الصناديق النقدية والعهد" value={data.banks.cash} currency={cur} indent={1} />
-                <Row label="أرصدة البنوك" value={data.banks.bank} currency={cur} indent={1} />
-                <Row label="إجمالي الأصول" value={data.inventory.value + data.banks.cash + data.banks.bank} currency={cur} bold color="blue" />
+            <div className="space-y-4">
+              <div className={`rounded-xl border p-3 text-sm flex items-center justify-between ${data.balanceSheet.isBalanced ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : 'bg-amber-50 border-amber-200 text-amber-800'}`}>
+                <span>{data.balanceSheet.isBalanced ? 'الميزانية متوازنة حسب دفتر الأستاذ المرحّل' : 'يوجد فرق بين إجمالي الأصول والخصوم وحقوق الملكية'}</span>
+                <span className="font-bold">حتى {data.balanceSheet.asOf} · الفرق {data.balanceSheet.difference.toFixed(2)} {cur}</span>
               </div>
-              {/* Liabilities + Equity */}
-              <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-                <div className="px-4 py-3 bg-red-700 text-white text-sm font-semibold">الخصوم وحقوق الملكية</div>
-                <div className="px-4 py-2 text-xs font-semibold text-slate-500 bg-slate-50">الخصوم</div>
-                <Row label="ضريبة القيمة المضافة المستحقة" value={data.vat.net > 0 ? data.vat.net : 0} currency={cur} indent={1} />
-                <div className="px-4 py-2 text-xs font-semibold text-slate-500 bg-slate-50">حقوق الملكية</div>
-                <Row label="صافي الربح / الخسارة" value={data.netProfit} currency={cur} indent={1} color={data.netProfit >= 0 ? 'emerald' : 'red'} />
-                <Row label="إجمالي الخصوم وحقوق الملكية"
-                  value={(data.vat.net > 0 ? data.vat.net : 0) + data.netProfit}
-                  currency={cur} bold color="red" />
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+                  <div className="px-4 py-3 bg-blue-700 text-white text-sm font-semibold">الأصول</div>
+                  {data.balanceSheet.assets.map(account => <Row key={account.id} label={`${account.code} — ${account.name}`} value={account.balance} currency={cur} indent={1} />)}
+                  <Row label="إجمالي الأصول" value={data.balanceSheet.assetsTotal} currency={cur} bold color="blue" />
+                </div>
+                <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+                  <div className="px-4 py-3 bg-red-700 text-white text-sm font-semibold">الخصوم وحقوق الملكية</div>
+                  <div className="px-4 py-2 text-xs font-semibold text-slate-500 bg-slate-50">الخصوم</div>
+                  {data.balanceSheet.liabilities.map(account => <Row key={account.id} label={`${account.code} — ${account.name}`} value={account.balance} currency={cur} indent={1} />)}
+                  <Row label="إجمالي الخصوم" value={data.balanceSheet.liabilitiesTotal} currency={cur} bold />
+                  <div className="px-4 py-2 text-xs font-semibold text-slate-500 bg-slate-50">حقوق الملكية</div>
+                  {data.balanceSheet.equity.map(account => <Row key={account.id} label={`${account.code} — ${account.name}`} value={account.balance} currency={cur} indent={1} />)}
+                  <Row label="الأرباح المتراكمة غير المقفلة" value={data.balanceSheet.currentEarnings} currency={cur} indent={1} color={data.balanceSheet.currentEarnings >= 0 ? 'emerald' : 'red'} />
+                  <Row label="إجمالي حقوق الملكية" value={data.balanceSheet.equityTotal} currency={cur} bold />
+                  <Row label="إجمالي الخصوم وحقوق الملكية" value={data.balanceSheet.liabilitiesAndEquity} currency={cur} bold color="red" />
+                </div>
               </div>
-              <div className="col-span-2 bg-amber-50 border border-amber-200 rounded-xl p-4 text-sm text-amber-700">
-                <strong>ملاحظة:</strong> هذه الميزانية تقديرية ومبسطة بناءً على بيانات المبيعات والمشتريات والمصاريف المسجلة. لميزانية كاملة يجب تسجيل كافة الأصول والخصوم في دليل الحسابات.
+              <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs text-slate-600">
+                تُحسب الميزانية من أرصدة القيود المرحّلة حتى تاريخ التقرير. يلزم تسجيل الأرصدة الافتتاحية وجميع الأصول والالتزامات خارج دورة البيع والشراء حتى تعكس المركز المالي بالكامل.
               </div>
             </div>
           )}
