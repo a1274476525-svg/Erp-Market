@@ -936,24 +936,42 @@ function setupIpcHandlers() {
       }
 
       await ensureStandardAccounts(tx)
-      const [salesAcc, cashAcc, bankAcc, cogsAcc, invAcc] = await Promise.all([
+      const [salesAcc, cashAcc, bankAcc, vatAcc, cogsAcc, invAcc] = await Promise.all([
         findAccByCode('4111', tx), findAccByCode('1111', tx), findAccByCode('1112', tx),
-        findAccByCode('521', tx), findAccByCode('1131', tx),
+        findAccByCode('2121', tx), findAccByCode('521', tx), findAccByCode('1131', tx),
       ])
       const refundAcc = order.paymentMethod === 'cash' ? cashAcc : bankAcc
       if (!salesAcc || !refundAcc || !cogsAcc || !invAcc) {
         throw new Error('تعذر إيجاد حسابات مرتجع المبيعات والنقدية/البنك والمخزون والتكلفة')
       }
+      if (!Number.isFinite(order.subtotal) || order.subtotal <= 0) {
+        throw new Error('لا يمكن حساب الخصم والضريبة النسبية لمرتجع على فاتورة مجموعها صفر')
+      }
+      // Allocate the original invoice discount and VAT proportionally to the returned pre-discount item value.
+      const returnRatio = r.total / order.subtotal
+      const discountShare = Number(order.discountAmount ?? 0) * returnRatio
+      const taxShare = Number(order.taxAmount ?? 0) * returnRatio
+      const salesReturnBase = r.total - discountShare
+      const refundTotal = salesReturnBase + taxShare
+      if (![discountShare, taxShare, salesReturnBase, refundTotal].every(Number.isFinite) ||
+          salesReturnBase < 0 || taxShare < 0 || refundTotal <= 0) {
+        throw new Error('تعذر حساب قيمة المرتجع بعد توزيع الخصم والضريبة')
+      }
+      const returnLines = [
+        { accountId: salesAcc.id, debit: salesReturnBase, credit: 0, description: 'مرتجع مبيعات بعد الخصم النسبي' },
+      ]
+      if (taxShare > 0) {
+        if (!vatAcc) throw new Error('حساب ضريبة المبيعات غير موجود')
+        returnLines.push({ accountId: vatAcc.id, debit: taxShare, credit: 0, description: 'عكس ضريبة مبيعات' })
+      }
+      returnLines.push({ accountId: refundAcc.id, debit: 0, credit: refundTotal, description: 'رد قيمة المرتجع بعد الضريبة' })
       await autoJE({
         date: new Date(r.returnDate),
         description: `مرتجع مبيعات - RTN-${r.id}`,
         reference: `RTN-${r.id}`,
         source: 'sale',
         sourceId: r.id,
-        lines: [
-          { accountId: salesAcc.id, debit: r.total, credit: 0, description: 'مرتجع مبيعات' },
-          { accountId: refundAcc.id, debit: 0, credit: r.total, description: 'رد قيمة المرتجع' },
-        ],
+        lines: returnLines,
         db: tx,
       })
       // Restore inventory at the original sale-time cost, in the same transaction.
