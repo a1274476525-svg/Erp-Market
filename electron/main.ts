@@ -2043,7 +2043,7 @@ function setupIpcHandlers() {
     })
   }
 
-  async function postSaleJE(order: { id: number; orderNumber: string; createdAt: Date; total: number; subtotal: number; discountAmount: number; taxAmount: number; paymentMethod: string; items: { productId: number; quantity: number; unitCost: number }[] }, db: AccountingDb = prisma) {
+  async function postSaleJE(order: { id: number; orderNumber: string; createdAt: Date; customerId?: number | null; total: number; subtotal: number; discountAmount: number; taxAmount: number; paymentMethod: string; items: { productId: number; quantity: number; unitCost: number }[] }, db: AccountingDb = prisma) {
     await ensureStandardAccounts(db)
     const [cashAcc, bankAcc, receivableAcc, salesAcc, vatAcc, cogsAcc, invAcc] = await Promise.all([
       findAccByCode('1111', db), findAccByCode('1112', db), findAccByCode('1121', db),
@@ -2054,7 +2054,7 @@ function setupIpcHandlers() {
       ? receivableAcc
       : order.paymentMethod === 'cash' ? cashAcc : bankAcc
     if (!drAcc || !salesAcc) throw new Error('تعذر إيجاد حساب النقدية/البنوك/العملاء أو المبيعات في دليل الحسابات')
-    if (order.paymentMethod === 'credit' && !(order as any).customerId) {
+    if (order.paymentMethod === 'credit' && !order.customerId) {
       throw new Error('يجب تحديد العميل عند تسجيل البيع الآجل')
     }
     const discountAmount = Number(order.discountAmount ?? 0)
@@ -2739,29 +2739,77 @@ function setupIpcHandlers() {
   // ─── EXTENDED REPORTS ─────────────────────────────────────────
 
   ipcHandle('reports:customerStatement', async (_, { customerId, from, to }: any = {}) => {
-    const where: any = { status: 'completed' }
-    if (customerId) where.customerId = Number(customerId)
-    if (from) { const d = new Date(from); d.setUTCHours(0,0,0,0); where.createdAt = { ...where.createdAt, gte: d } }
-    if (to)   { const d = new Date(to); d.setUTCDate(d.getUTCDate()+1); d.setUTCHours(0,0,0,0); where.createdAt = { ...where.createdAt, lt: d } }
-    const orders = await prisma.posOrder.findMany({
-      where, include: { customer: true, items: { include: { product: true } } }, orderBy: { createdAt: 'asc' },
+    const id = Number(customerId)
+    if (!Number.isInteger(id) || id <= 0) throw new Error('اختر عميلًا صحيحًا')
+    const dateRange = (value: string, end = false) => {
+      if (!value) return undefined
+      const d = new Date(value)
+      if (Number.isNaN(d.getTime())) throw new Error('نطاق تاريخ غير صحيح')
+      if (end) { d.setUTCDate(d.getUTCDate() + 1); d.setUTCHours(0, 0, 0, 0) }
+      else d.setUTCHours(0, 0, 0, 0)
+      return d
+    }
+    const start = dateRange(from)
+    const end = dateRange(to, true)
+    const orderWhere: any = { customerId: id, status: 'completed' }
+    const paymentWhere: any = { customerId: id }
+    if (start) { orderWhere.createdAt = { ...orderWhere.createdAt, gte: start }; paymentWhere.date = { ...paymentWhere.date, gte: start } }
+    if (end) { orderWhere.createdAt = { ...orderWhere.createdAt, lt: end }; paymentWhere.date = { ...paymentWhere.date, lt: end } }
+    const [orders, payments, customer] = await Promise.all([
+      prisma.posOrder.findMany({ where: orderWhere, orderBy: { createdAt: 'asc' } }),
+      prisma.customerPayment.findMany({ where: paymentWhere, orderBy: { date: 'asc' }, include: { order: true } }),
+      prisma.customer.findUnique({ where: { id } }),
+    ])
+    if (!customer) throw new Error('العميل غير موجود')
+    const events = [
+      ...orders.map(o => ({ date: o.createdAt, description: `فاتورة مبيعات ${o.orderNumber}`, amount: o.total, debit: o.total, credit: 0, kind: 'sale' })),
+      ...payments.map(p => ({ date: p.date, description: `تحصيل على ${p.order.orderNumber}${p.reference ? ` - ${p.reference}` : ''}`, amount: -p.amount, debit: 0, credit: p.amount, kind: 'receipt' })),
+    ].sort((x, y) => new Date(x.date).getTime() - new Date(y.date).getTime())
+    let balance = 0
+    const rows = events.map(event => {
+      balance += event.amount
+      return { ...event, balance }
     })
-    let running = 0
-    const rows = orders.map(o => { running += o.total; return { ...o, runningBalance: running } })
-    return { rows, total: orders.reduce((s, o) => s + o.total, 0), count: orders.length }
+    const totalSales = orders.reduce((sum, o) => sum + o.total, 0)
+    const totalPayments = payments.reduce((sum, p) => sum + p.amount, 0)
+    return { customer, rows, total: balance, balance, totalSales, totalPayments, count: rows.length }
   })
 
   ipcHandle('reports:supplierStatement', async (_, { supplierId, from, to }: any = {}) => {
-    const where: any = { status: 'confirmed' }
-    if (supplierId) where.supplierId = Number(supplierId)
-    if (from) { const d = new Date(from); d.setUTCHours(0,0,0,0); where.invoiceDate = { ...where.invoiceDate, gte: d } }
-    if (to)   { const d = new Date(to); d.setUTCDate(d.getUTCDate()+1); d.setUTCHours(0,0,0,0); where.invoiceDate = { ...where.invoiceDate, lt: d } }
-    const invoices = await prisma.purchaseInvoice.findMany({
-      where, include: { supplier: true, items: { include: { product: true } } }, orderBy: { invoiceDate: 'asc' },
+    const id = Number(supplierId)
+    if (!Number.isInteger(id) || id <= 0) throw new Error('اختر موردًا صحيحًا')
+    const dateRange = (value: string, end = false) => {
+      if (!value) return undefined
+      const d = new Date(value)
+      if (Number.isNaN(d.getTime())) throw new Error('نطاق تاريخ غير صحيح')
+      if (end) { d.setUTCDate(d.getUTCDate() + 1); d.setUTCHours(0, 0, 0, 0) }
+      else d.setUTCHours(0, 0, 0, 0)
+      return d
+    }
+    const start = dateRange(from)
+    const end = dateRange(to, true)
+    const invoiceWhere: any = { supplierId: id, status: 'confirmed' }
+    const paymentWhere: any = { supplierId: id }
+    if (start) { invoiceWhere.invoiceDate = { ...invoiceWhere.invoiceDate, gte: start }; paymentWhere.date = { ...paymentWhere.date, gte: start } }
+    if (end) { invoiceWhere.invoiceDate = { ...invoiceWhere.invoiceDate, lt: end }; paymentWhere.date = { ...paymentWhere.date, lt: end } }
+    const [invoices, payments, supplier] = await Promise.all([
+      prisma.purchaseInvoice.findMany({ where: invoiceWhere, orderBy: { invoiceDate: 'asc' } }),
+      prisma.supplierPayment.findMany({ where: paymentWhere, orderBy: { date: 'asc' }, include: { invoice: true } }),
+      prisma.supplier.findUnique({ where: { id } }),
+    ])
+    if (!supplier) throw new Error('المورد غير موجود')
+    const events = [
+      ...invoices.map(i => ({ date: i.invoiceDate, description: `فاتورة مشتريات ${i.invoiceNumber ?? `INV-${i.id}`}`, amount: i.total, debit: 0, credit: i.total, kind: 'purchase' })),
+      ...payments.map(p => ({ date: p.date, description: `سداد على ${p.invoice.invoiceNumber ?? `INV-${p.invoice.id}`}${p.reference ? ` - ${p.reference}` : ''}`, amount: -p.amount, debit: p.amount, credit: 0, kind: 'payment' })),
+    ].sort((x, y) => new Date(x.date).getTime() - new Date(y.date).getTime())
+    let balance = 0
+    const rows = events.map(event => {
+      balance += event.amount
+      return { ...event, balance }
     })
-    let running = 0
-    const rows = invoices.map(i => { running += i.total; return { ...i, runningBalance: running } })
-    return { rows, total: invoices.reduce((s, i) => s + i.total, 0), count: invoices.length }
+    const totalInvoices = invoices.reduce((sum, i) => sum + i.total, 0)
+    const totalPayments = payments.reduce((sum, p) => sum + p.amount, 0)
+    return { supplier, rows, total: balance, balance, totalInvoices, totalPayments, count: rows.length }
   })
 
   ipcHandle('reports:vatDetails', async (_, { from, to }: any = {}) => {
