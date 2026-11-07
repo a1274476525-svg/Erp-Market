@@ -729,7 +729,7 @@ function setupIpcHandlers() {
   ipcHandle('invoices:getAll', () =>
     prisma.purchaseInvoice.findMany({
       where: { status: 'confirmed' },
-      include: { supplier: true, items: { include: { product: true } }, payments: true },
+      include: { supplier: true, items: { include: { product: true } }, payments: true, returns: { include: { items: true } } },
       orderBy: { invoiceDate: 'desc' },
     })
   )
@@ -809,8 +809,15 @@ function setupIpcHandlers() {
       const warehouse = await getDefaultWarehouse(tx)
       for (const item of inv.items) {
         if (!Number.isFinite(item.quantity) || item.quantity <= 0 || !Number.isFinite(item.unitPrice) || item.unitPrice < 0) throw new Error('بيانات صنف شراء غير صالحة')
+        const productCost = await tx.product.findUnique({ where: { id: item.productId }, select: { costPrice: true } })
+        if (!productCost) throw new Error('المنتج غير موجود')
+        const stockBefore = await tx.warehouseStock.aggregate({ where: { productId: item.productId }, _sum: { quantity: true } })
+        const quantityBefore = stockBefore._sum.quantity ?? 0
+        const weightedAverageCost = quantityBefore + item.quantity > 0
+          ? ((quantityBefore * productCost.costPrice) + (item.quantity * item.unitPrice)) / (quantityBefore + item.quantity)
+          : item.unitPrice
         await changeWarehouseStock(tx, warehouse.id, item.productId, item.quantity)
-        await tx.product.update({ where: { id: item.productId }, data: { costPrice: item.unitPrice } })
+        await tx.product.update({ where: { id: item.productId }, data: { costPrice: weightedAverageCost } })
         await tx.stockMovement.create({
           data: { productId: item.productId, quantity: item.quantity, type: 'purchase', referenceId: id },
         })
@@ -820,6 +827,108 @@ function setupIpcHandlers() {
     })
 
     return invoice
+  })
+
+  ipcHandle('invoices:createReturn', async (_, data: { invoiceId: number; items: { productId: number; quantity: number }[]; reason?: string }) => {
+    if (!Number.isInteger(data.invoiceId) || !Array.isArray(data.items) || data.items.length === 0) {
+      throw new Error('اختر فاتورة وحدد صنفًا واحدًا على الأقل للمرتجع')
+    }
+    return prisma.$transaction(async (tx) => {
+      const invoice = await tx.purchaseInvoice.findUnique({
+        where: { id: data.invoiceId },
+        include: { items: true, returns: { include: { items: true } } },
+      })
+      if (!invoice || invoice.status !== 'confirmed') throw new Error('فاتورة الشراء غير موجودة أو غير مؤكدة')
+      if (!Number.isFinite(invoice.subtotal) || invoice.subtotal <= 0) throw new Error('لا يمكن حساب ضريبة مرتجع لفاتورة مجموعها صفر')
+
+      const requested = new Map<number, number>()
+      for (const item of data.items) {
+        if (!Number.isInteger(item.productId) || !Number.isFinite(item.quantity) || item.quantity <= 0) {
+          throw new Error('كمية صنف المرتجع غير صالحة')
+        }
+        requested.set(item.productId, (requested.get(item.productId) ?? 0) + item.quantity)
+      }
+
+      const normalizedItems = [...requested.entries()].map(([productId, quantity]) => {
+        const purchased = invoice.items.filter(item => item.productId === productId)
+        if (purchased.length === 0) throw new Error('الصنف غير موجود في فاتورة الشراء')
+        const purchasedQty = purchased.reduce((sum, item) => sum + item.quantity, 0)
+        const returnedQty = invoice.returns.reduce((sum, ret) =>
+          sum + ret.items.filter(item => item.productId === productId).reduce((part, item) => part + item.quantity, 0), 0)
+        if (quantity > purchasedQty - returnedQty + 0.000001) {
+          throw new Error(`كمية المرتجع تتجاوز الكمية المشتراة للصنف ${purchased[0].productId}`)
+        }
+        const unitPrice = purchased.reduce((sum, item) => sum + item.unitPrice * item.quantity, 0) / purchasedQty
+        return { productId, productName: `صنف #${productId}`, quantity, unitPrice, total: quantity * unitPrice }
+      })
+
+      const warehouse = await getDefaultWarehouse(tx)
+      const itemsWithCost = []
+      for (const item of normalizedItems) {
+        const product = await tx.product.findUnique({ where: { id: item.productId }, select: { name: true, costPrice: true } })
+        if (!product) throw new Error('المنتج غير موجود')
+        const stock = await tx.warehouseStock.findUnique({
+          where: { warehouseId_productId: { warehouseId: warehouse.id, productId: item.productId } },
+        })
+        if (!stock || stock.quantity < item.quantity) {
+          throw new Error(`المخزون غير كافٍ لإرجاع الصنف ${product.name} إلى المورد`)
+        }
+        itemsWithCost.push({ ...item, productName: product.name, unitCost: product.costPrice })
+      }
+
+      const subtotal = itemsWithCost.reduce((sum, item) => sum + item.total, 0)
+      const ratio = subtotal / invoice.subtotal
+      const taxShare = Math.round(invoice.taxAmount * ratio * 100) / 100
+      const supplierCredit = Math.round((subtotal + taxShare) * 100) / 100
+      const inventoryCost = Math.round(itemsWithCost.reduce((sum, item) => sum + item.quantity * item.unitCost, 0) * 100) / 100
+      const variance = Math.round((subtotal - inventoryCost) * 100) / 100
+      if (!Number.isFinite(supplierCredit) || supplierCredit <= 0 || !Number.isFinite(inventoryCost) || inventoryCost <= 0) {
+        throw new Error('تعذر حساب قيمة مرتجع المورد')
+      }
+
+      const ret = await tx.purchaseReturn.create({
+        data: {
+          invoiceId: invoice.id,
+          reason: data.reason?.trim() || null,
+          total: subtotal,
+          items: { create: itemsWithCost },
+        },
+        include: { items: true },
+      })
+      for (const item of ret.items) {
+        await changeWarehouseStock(tx, warehouse.id, item.productId, -item.quantity)
+        await tx.stockMovement.create({
+          data: { productId: item.productId, quantity: -item.quantity, type: 'purchase_return', referenceId: ret.id, note: `مرتجع مورد ${invoice.invoiceNumber ?? invoice.id}` },
+        })
+      }
+
+      await ensureStandardAccounts(tx)
+      const [payableAcc, inventoryAcc, vatAcc, returnsAcc] = await Promise.all([
+        findAccByCode('2111', tx), findAccByCode('1131', tx),
+        findAccByCode('2121', tx), findAccByCode('512', tx),
+      ])
+      if (!payableAcc || !inventoryAcc || !returnsAcc) throw new Error('حساب الموردين أو المخزون أو مردودات المشتريات غير موجود')
+      const lines: { accountId: number; debit: number; credit: number; description?: string }[] = [
+        { accountId: payableAcc.id, debit: supplierCredit, credit: 0, description: 'إشعار دائن من المورد' },
+        { accountId: inventoryAcc.id, debit: 0, credit: inventoryCost, description: 'خروج مخزون مرتجع للمورد' },
+      ]
+      if (taxShare > 0) {
+        if (!vatAcc) throw new Error('حساب ضريبة القيمة المضافة غير موجود')
+        lines.push({ accountId: vatAcc.id, debit: 0, credit: taxShare, description: 'عكس ضريبة مدخلات' })
+      }
+      if (variance > 0) lines.push({ accountId: returnsAcc.id, debit: 0, credit: variance, description: 'مردودات مشتريات / فرق تكلفة' })
+      else if (variance < 0) lines.push({ accountId: returnsAcc.id, debit: Math.abs(variance), credit: 0, description: 'فرق تكلفة مردودات مشتريات' })
+      await autoJE({
+        date: new Date(ret.returnDate),
+        description: `مرتجع مشتريات - PR-${ret.id}`,
+        reference: invoice.invoiceNumber ?? `INV-${invoice.id}`,
+        source: 'purchase_return',
+        sourceId: ret.id,
+        lines,
+        db: tx,
+      })
+      return { ...ret, taxAmount: taxShare, supplierCredit }
+    })
   })
 
   // ─── PURCHASE REQUESTS ─────────────────────────────────────────
