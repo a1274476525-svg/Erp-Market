@@ -2844,7 +2844,7 @@ function setupIpcHandlers() {
       const netDebit = row.debit - row.credit
       const netCredit = row.credit - row.debit
       if (account.type === 'revenue') totalRevenue += netCredit
-      if (account.type === 'expense' && String(account.code).startsWith('52')) cogs += netDebit
+      if (account.type === 'expense' && (String(account.code).startsWith('52') || String(account.code) === '512')) cogs += netDebit
       if (account.type === 'expense' && String(account.code).startsWith('6')) {
         totalExpenses += netDebit
         const category = account.name || 'مصروفات تشغيلية'
@@ -3046,27 +3046,49 @@ function setupIpcHandlers() {
 
   ipcHandle('reports:vatDetails', async (_, { from, to }: any = {}) => {
     const df: any = {}
-    if (from) { const d = new Date(from); d.setUTCHours(0,0,0,0); df.gte = d }
-    if (to)   { const d = new Date(to); d.setUTCDate(d.getUTCDate()+1); d.setUTCHours(0,0,0,0); df.lte = d }
-    const [orders, invoices] = await Promise.all([
-      prisma.posOrder.findMany({ where: { status: 'completed', ...(df.gte ? { createdAt: df } : {}) }, include: { customer: true }, orderBy: { createdAt: 'asc' } }),
-      prisma.purchaseInvoice.findMany({ where: { status: 'confirmed', ...(df.gte ? { invoiceDate: df } : {}) }, include: { supplier: true }, orderBy: { invoiceDate: 'asc' } }),
+    if (from) { const d = new Date(from); d.setUTCHours(0, 0, 0, 0); df.gte = d }
+    if (to)   { const d = new Date(to); d.setUTCDate(d.getUTCDate() + 1); d.setUTCHours(0, 0, 0, 0); df.lt = d }
+    if (from && to && new Date(from) >= new Date(to + 'T23:59:59.999Z')) throw new Error('تاريخ بداية التقرير يجب أن يسبق تاريخ النهاية')
+    const [orders, invoices, salesReturns, purchaseReturns] = await Promise.all([
+      prisma.posOrder.findMany({ where: { status: 'completed', ...(Object.keys(df).length ? { createdAt: df } : {}) }, include: { customer: true }, orderBy: { createdAt: 'asc' } }),
+      prisma.purchaseInvoice.findMany({ where: { status: 'confirmed', ...(Object.keys(df).length ? { invoiceDate: df } : {}) }, include: { supplier: true }, orderBy: { invoiceDate: 'asc' } }),
+      prisma.saleReturn.findMany({ where: Object.keys(df).length ? { returnDate: df } : {}, include: { order: { include: { customer: true } } }, orderBy: { returnDate: 'asc' } }),
+      prisma.purchaseReturn.findMany({ where: Object.keys(df).length ? { returnDate: df } : {}, include: { invoice: { include: { supplier: true } } }, orderBy: { returnDate: 'asc' } }),
     ])
     const salesRows = orders.filter(o => o.taxAmount > 0).map(o => ({
       date: o.createdAt, ref: o.orderNumber, party: o.customer?.name ?? 'عميل نقدي',
       type: 'sale', subtotal: o.subtotal, taxRate: o.taxRate, taxAmount: o.taxAmount, total: o.total,
     }))
+    const salesReturnRows = salesReturns.map(ret => {
+      const ratio = ret.order.subtotal > 0 ? ret.total / ret.order.subtotal : 0
+      const subtotal = ret.total - ret.order.discountAmount * ratio
+      const taxAmount = ret.order.taxAmount * ratio
+      return {
+        date: ret.returnDate, ref: `RTN-${ret.id}`, party: ret.order.customer?.name ?? 'عميل نقدي',
+        type: 'sale_return', subtotal: -subtotal, taxRate: ret.order.taxRate, taxAmount: -taxAmount, total: -(subtotal + taxAmount),
+      }
+    })
     const purchaseRows = invoices.filter(i => i.taxAmount > 0).map(i => ({
       date: i.invoiceDate, ref: i.invoiceNumber ?? `INV-${i.id}`, party: i.supplier?.name ?? 'مورد',
       type: 'purchase', subtotal: i.subtotal, taxRate: i.taxRate, taxAmount: i.taxAmount, total: i.total,
     }))
+    const purchaseReturnRows = purchaseReturns.map(ret => {
+      const taxAmount = ret.invoice.subtotal > 0 ? ret.invoice.taxAmount * ret.total / ret.invoice.subtotal : 0
+      return {
+        date: ret.returnDate, ref: `PR-${ret.id}`, party: ret.invoice.supplier?.name ?? 'مورد',
+        type: 'purchase_return', subtotal: -ret.total, taxRate: ret.invoice.taxRate, taxAmount: -taxAmount, total: -(ret.total + taxAmount),
+      }
+    })
+    const salesAll = [...salesRows, ...salesReturnRows].sort((x, y) => new Date(x.date).getTime() - new Date(y.date).getTime())
+    const purchasesAll = [...purchaseRows, ...purchaseReturnRows].sort((x, y) => new Date(x.date).getTime() - new Date(y.date).getTime())
     return {
-      salesRows, purchaseRows,
+      salesRows: salesAll,
+      purchaseRows: purchasesAll,
       totals: {
-        salesSubtotal: salesRows.reduce((s, r) => s + r.subtotal, 0),
-        salesTax:      salesRows.reduce((s, r) => s + r.taxAmount, 0),
-        purchaseSubtotal: purchaseRows.reduce((s, r) => s + r.subtotal, 0),
-        purchaseTax:   purchaseRows.reduce((s, r) => s + r.taxAmount, 0),
+        salesSubtotal: salesAll.reduce((sum, row) => sum + row.subtotal, 0),
+        salesTax: salesAll.reduce((sum, row) => sum + row.taxAmount, 0),
+        purchaseSubtotal: purchasesAll.reduce((sum, row) => sum + row.subtotal, 0),
+        purchaseTax: purchasesAll.reduce((sum, row) => sum + row.taxAmount, 0),
       },
     }
   })
