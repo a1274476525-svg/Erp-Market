@@ -2936,22 +2936,36 @@ function setupIpcHandlers() {
     if (start && end && start >= end) throw new Error('تاريخ البداية يجب أن يسبق تاريخ النهاية')
     const invoiceWhere: any = { supplierId: id, status: 'confirmed' }
     const paymentWhere: any = { supplierId: id }
-    if (start) { invoiceWhere.invoiceDate = { gte: start, ...(end ? { lt: end } : {}) }; paymentWhere.date = { gte: start, ...(end ? { lt: end } : {}) } }
-    else if (end) { invoiceWhere.invoiceDate = { lt: end }; paymentWhere.date = { lt: end } }
+    const returnWhere: any = { invoice: { supplierId: id, status: 'confirmed' } }
+    if (start) {
+      invoiceWhere.invoiceDate = { gte: start, ...(end ? { lt: end } : {}) }
+      paymentWhere.date = { gte: start, ...(end ? { lt: end } : {}) }
+      returnWhere.returnDate = { gte: start, ...(end ? { lt: end } : {}) }
+    } else if (end) {
+      invoiceWhere.invoiceDate = { lt: end }
+      paymentWhere.date = { lt: end }
+      returnWhere.returnDate = { lt: end }
+    }
     const openingWhereInvoices: any = { supplierId: id, status: 'confirmed', ...(start ? { invoiceDate: { lt: start } } : { id: -1 }) }
     const openingWherePayments: any = { supplierId: id, ...(start ? { date: { lt: start } } : { id: -1 }) }
-    const [invoices, payments, supplier, openingInvoices, openingPayments] = await Promise.all([
+    const openingWhereReturns: any = { invoice: { supplierId: id, status: 'confirmed' }, ...(start ? { returnDate: { lt: start } } : { id: -1 }) }
+    const [invoices, payments, returns, supplier, openingInvoices, openingPayments, openingReturns] = await Promise.all([
       prisma.purchaseInvoice.findMany({ where: invoiceWhere, orderBy: { invoiceDate: 'asc' } }),
       prisma.supplierPayment.findMany({ where: paymentWhere, orderBy: { date: 'asc' }, include: { invoice: true } }),
+      prisma.purchaseReturn.findMany({ where: returnWhere, orderBy: { returnDate: 'asc' }, include: { invoice: true } }),
       prisma.supplier.findUnique({ where: { id } }),
       prisma.purchaseInvoice.aggregate({ where: openingWhereInvoices, _sum: { total: true } }),
       prisma.supplierPayment.aggregate({ where: openingWherePayments, _sum: { amount: true } }),
+      prisma.purchaseReturn.findMany({ where: openingWhereReturns, include: { invoice: true } }),
     ])
     if (!supplier) throw new Error('المورد غير موجود')
-    const openingBalance = (openingInvoices._sum.total ?? 0) - (openingPayments._sum.amount ?? 0)
+    const returnValue = (ret: any) => ret.total + (ret.invoice.subtotal > 0 ? ret.invoice.taxAmount * ret.total / ret.invoice.subtotal : 0)
+    const openingReturnTotal = openingReturns.reduce((sum: number, ret: any) => sum + returnValue(ret), 0)
+    const openingBalance = (openingInvoices._sum.total ?? 0) - (openingPayments._sum.amount ?? 0) - openingReturnTotal
     const events = [
       ...invoices.map(i => ({ date: i.invoiceDate, description: `فاتورة مشتريات ${i.invoiceNumber ?? `INV-${i.id}`}`, amount: i.total, debit: 0, credit: i.total, kind: 'purchase' })),
       ...payments.map(p => ({ date: p.date, description: `سداد على ${p.invoice.invoiceNumber ?? `INV-${p.invoice.id}`}${p.reference ? ` - ${p.reference}` : ''}`, amount: -p.amount, debit: p.amount, credit: 0, kind: 'payment' })),
+      ...returns.map(ret => { const value = returnValue(ret); return { date: ret.returnDate, description: `إشعار دائن / مرتجع مشتريات ${ret.id}`, amount: -value, debit: value, credit: 0, kind: 'return' } }),
     ].sort((x, y) => new Date(x.date).getTime() - new Date(y.date).getTime())
     let balance = openingBalance
     const rows = events.map(event => {
@@ -2960,7 +2974,8 @@ function setupIpcHandlers() {
     })
     const totalInvoices = invoices.reduce((sum, i) => sum + i.total, 0)
     const totalPayments = payments.reduce((sum, p) => sum + p.amount, 0)
-    return { supplier, rows, openingBalance, total: balance, balance, totalInvoices, totalPayments, count: rows.length }
+    const totalReturns = returns.reduce((sum, ret) => sum + returnValue(ret), 0)
+    return { supplier, rows, openingBalance, total: balance, balance, totalInvoices, totalPayments, totalReturns, count: rows.length }
   })
 
   ipcHandle('reports:vatDetails', async (_, { from, to }: any = {}) => {
