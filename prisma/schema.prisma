@@ -520,8 +520,8 @@ model JournalEntryLine {
 // ─── CUSTOMER RECEIPTS / ACCOUNTS RECEIVABLE ─────────────────────
 model CustomerPayment {
   id            Int        @id @default(autoincrement())
-  customer      Customer   @relation(fields: [customerId], references: [id])
-  customerId    Int
+  customer      Customer?  @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  customerId    Int?
   order         PosOrder   @relation(fields: [orderId], references: [id])
   orderId       Int
   amount        Float
@@ -535,8 +535,8 @@ model CustomerPayment {
 // ─── SUPPLIER PAYMENTS / ACCOUNTS PAYABLE ─────────────────────────
 model SupplierPayment {
   id            Int            @id @default(autoincrement())
-  supplier      Supplier       @relation(fields: [supplierId], references: [id])
-  supplierId    Int
+  supplier      Supplier?      @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+  supplierId    Int?
   invoice       PurchaseInvoice @relation(fields: [invoiceId], references: [id])
   invoiceId     Int
   amount        Float
