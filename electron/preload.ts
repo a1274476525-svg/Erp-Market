@@ -36,12 +36,16 @@ contextBridge.exposeInMainWorld('api', {
     update:       (data: any)  => ipcRenderer.invoke('customers:update', data),
     delete:       (id: number) => ipcRenderer.invoke('customers:delete', id),
     addPoints:    (data: any)  => ipcRenderer.invoke('customers:addPoints', data),
+    getPayments:  (customerId?: number) => ipcRenderer.invoke('customers:getPayments', customerId),
+    receivePayment: (data: any) => ipcRenderer.invoke('customers:receivePayment', data),
   },
   suppliers: {
     getAll: () => ipcRenderer.invoke('suppliers:getAll'),
     create: (data: any)  => ipcRenderer.invoke('suppliers:create', data),
     update: (data: any)  => ipcRenderer.invoke('suppliers:update', data),
     delete: (id: number) => ipcRenderer.invoke('suppliers:delete', id),
+    getPayments: (supplierId?: number) => ipcRenderer.invoke('suppliers:getPayments', supplierId),
+    payInvoice: (data: any) => ipcRenderer.invoke('suppliers:payInvoice', data),
   },
   invoices: {
     getAll:       ()           => ipcRenderer.invoke('invoices:getAll'),
