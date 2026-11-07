@@ -2825,15 +2825,42 @@ function setupIpcHandlers() {
       row.debit += line.debit
       row.credit += line.credit
     }
-    const trialBalance = Array.from(tbMap.values())
-      .sort((x, y) => x.account.code.localeCompare(y.account.code, undefined, { numeric: true }))
-      .map(row => ({
-        code: row.account.code,
-        name: row.account.name,
-        type: row.account.type,
-        debit: row.debit,
-        credit: row.credit,
-      }))
+    const openingTbMap = new Map<number, { account: any; debit: number; credit: number }>()
+    if (from) {
+      const openingDate = new Date(from)
+      openingDate.setUTCHours(0, 0, 0, 0)
+      const openingLines = await prisma.journalEntryLine.findMany({
+        where: { entry: { status: 'posted', date: { lt: openingDate } } },
+        include: { account: true },
+      })
+      for (const line of openingLines) {
+        const row = openingTbMap.get(line.accountId) ?? { account: line.account, debit: 0, credit: 0 }
+        row.debit += line.debit
+        row.credit += line.credit
+        openingTbMap.set(line.accountId, row)
+      }
+    }
+    const allTbIds = new Set([...tbMap.keys(), ...openingTbMap.keys()])
+    const trialBalance = [...allTbIds].map(accountId => {
+      const period = tbMap.get(accountId)
+      const opening = openingTbMap.get(accountId)
+      const account = period?.account ?? opening!.account
+      const debit = period?.debit ?? 0
+      const credit = period?.credit ?? 0
+      const openingBalance = account.normalBalance === 'debit'
+        ? (opening?.debit ?? 0) - (opening?.credit ?? 0)
+        : (opening?.credit ?? 0) - (opening?.debit ?? 0)
+      const movement = account.normalBalance === 'debit' ? debit - credit : credit - debit
+      return {
+        code: account.code,
+        name: account.name,
+        type: account.type,
+        openingBalance,
+        debit,
+        credit,
+        closingBalance: openingBalance + movement,
+      }
+    }).sort((x, y) => x.code.localeCompare(y.code, undefined, { numeric: true }))
 
     let totalRevenue = 0
     let cogs = 0
