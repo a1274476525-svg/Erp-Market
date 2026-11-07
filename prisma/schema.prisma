@@ -242,6 +242,9 @@ model PosOrderItem {
   productName String
   quantity    Float
   unitPrice   Float
+  // Snapshot of the product cost at the moment the sale is created.
+  // Legacy rows default to zero because their historical cost cannot be inferred safely.
+  unitCost    Float    @default(0)
   total       Float
 }
 
