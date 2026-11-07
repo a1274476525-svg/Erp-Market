@@ -22,6 +22,7 @@ export const PAGES = [
   { path: '/chart-of-accounts', label: 'دليل الحسابات' },
   { path: '/banks',             label: 'البنوك والصناديق' },
   { path: '/journal-entries',  label: 'قيود اليومية' },
+  { path: '/settlements',      label: 'التحصيلات وسداد الموردين' },
   { path: '/settings',          label: 'الإعدادات' },
   { path: '/roles',             label: 'الوظائف' },
   { path: '/users',             label: 'المستخدمون' },
