@@ -764,6 +764,10 @@ function setupIpcHandlers() {
 
   // ─── POS ───────────────────────────────────────────────────────
   ipcHandle('pos:createOrder', async (_, { items, customerId, ...header }) => {
+    if (!['cash', 'card', 'instapay', 'vodafone', 'credit'].includes(header.paymentMethod ?? 'cash')) {
+      throw new Error('طريقة دفع غير مدعومة')
+    }
+    if (header.paymentMethod === 'credit' && !customerId) throw new Error('اختر العميل أولاً لتسجيل الفاتورة آجلاً')
     if (!Array.isArray(items) || items.length === 0) throw new Error('أضف صنفًا واحدًا على الأقل')
     for (const item of items) {
       if (!Number.isInteger(item.productId) || !Number.isFinite(item.quantity) || item.quantity <= 0) {
@@ -780,6 +784,10 @@ function setupIpcHandlers() {
       })
       const costByProduct = new Map(products.map(product => [product.id, product.costPrice]))
       if (products.length !== productIds.length) throw new Error('يوجد منتج غير موجود أو غير نشط')
+      if (header.paymentMethod === 'credit') {
+        const customer = await tx.customer.findUnique({ where: { id: customerId }, select: { id: true } })
+        if (!customer) throw new Error('العميل المحدد غير موجود')
+      }
       const o = await tx.posOrder.create({
         data: {
           orderNumber: `ORD-${num}`,
@@ -1924,13 +1932,18 @@ function setupIpcHandlers() {
 
   async function postSaleJE(order: { id: number; orderNumber: string; createdAt: Date; total: number; subtotal: number; discountAmount: number; taxAmount: number; paymentMethod: string; items: { productId: number; quantity: number; unitCost: number }[] }, db: AccountingDb = prisma) {
     await ensureStandardAccounts(db)
-    const [cashAcc, bankAcc, salesAcc, vatAcc, cogsAcc, invAcc] = await Promise.all([
-      findAccByCode('1111', db), findAccByCode('1112', db),
+    const [cashAcc, bankAcc, receivableAcc, salesAcc, vatAcc, cogsAcc, invAcc] = await Promise.all([
+      findAccByCode('1111', db), findAccByCode('1112', db), findAccByCode('1121', db),
       findAccByCode('4111', db), findAccByCode('2121', db),
       findAccByCode('521', db),  findAccByCode('1131', db),
     ])
-    const drAcc = order.paymentMethod === 'cash' ? cashAcc : bankAcc
-    if (!drAcc || !salesAcc) throw new Error('تعذر إيجاد حسابات النقدية/المبيعات في دليل الحسابات')
+    const drAcc = order.paymentMethod === 'credit'
+      ? receivableAcc
+      : order.paymentMethod === 'cash' ? cashAcc : bankAcc
+    if (!drAcc || !salesAcc) throw new Error('تعذر إيجاد حساب النقدية/البنوك/العملاء أو المبيعات في دليل الحسابات')
+    if (order.paymentMethod === 'credit' && !(order as any).customerId) {
+      throw new Error('يجب تحديد العميل عند تسجيل البيع الآجل')
+    }
     const discountAmount = Number(order.discountAmount ?? 0)
     if (!Number.isFinite(discountAmount) || discountAmount < 0 || discountAmount > order.subtotal) {
       throw new Error('قيمة خصم فاتورة البيع غير صالحة')
