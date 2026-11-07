@@ -11,6 +11,7 @@ const PAYMENT_METHODS = [
   { value: 'card',      label: 'بطاقة' },
   { value: 'instapay',  label: 'إنستاباي' },
   { value: 'vodafone',  label: 'فودافون كاش' },
+  { value: 'credit',    label: 'آجل على العميل' },
 ]
 
 function Receipt({ order, settings, onClose }: { order: any; settings: any; onClose: () => void }) {
@@ -171,6 +172,10 @@ export default function POS() {
 
   async function checkout() {
     if (cart.length === 0) return
+    if (paymentMethod === 'credit' && !customerId) {
+      alert('اختر العميل أولاً لتسجيل الفاتورة على الحساب')
+      return
+    }
     setSaving(true)
     try {
       const order = await window.api.pos.createOrder({
