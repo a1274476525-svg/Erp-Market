@@ -14,7 +14,7 @@ interface FinancialData {
   vat: { collected: number; paid: number; net: number }
   inventory: { value: number }
   banks: { cash: number; bank: number; accounts: any[] }
-  trialBalance: { code: string; name: string; type: string; debit: number; credit: number }[]
+  trialBalance: { code: string; name: string; type: string; openingBalance: number; debit: number; credit: number; closingBalance: number }[]
   balanceSheet: {
     asOf: string
     assets: { id: number; code: string; name: string; balance: number }[]
@@ -127,9 +127,9 @@ export default function FinancialReports() {
       rows.push(['إجمالي الخصوم وحقوق الملكية', data.balanceSheet.liabilitiesAndEquity])
       rows.push(['فرق الموازنة', data.balanceSheet.difference])
     } else if (tab === 'trial') {
-      rows.push(['كود الحساب', 'الحساب', 'النوع', 'مدين', 'دائن'])
-      data.trialBalance.forEach(row => rows.push([row.code, row.name, row.type, row.debit, row.credit]))
-      rows.push(['', 'الإجمالي', '', data.trialBalance.reduce((sum, row) => sum + row.debit, 0), data.trialBalance.reduce((sum, row) => sum + row.credit, 0)])
+      rows.push(['كود الحساب', 'الحساب', 'النوع', 'رصيد أول المدة', 'مدين الفترة', 'دائن الفترة', 'رصيد آخر المدة'])
+      data.trialBalance.forEach(row => rows.push([row.code, row.name, row.type, row.openingBalance, row.debit, row.credit, row.closingBalance]))
+      rows.push(['', 'الإجمالي', '', '', data.trialBalance.reduce((sum, row) => sum + row.debit, 0), data.trialBalance.reduce((sum, row) => sum + row.credit, 0), ''])
     } else {
       rows.push(['البند', 'القيمة'])
       rows.push(['وعاء مبيعات', data.revenue.total])
@@ -256,8 +256,10 @@ export default function FinancialReports() {
                     <th className="px-4 py-3 text-right">كود</th>
                     <th className="px-4 py-3 text-right">الحساب</th>
                     <th className="px-4 py-3 text-center">النوع</th>
-                    <th className="px-4 py-3 text-center">مدين</th>
-                    <th className="px-4 py-3 text-center">دائن</th>
+                    <th className="px-4 py-3 text-center">رصيد أول المدة</th>
+                    <th className="px-4 py-3 text-center">مدين الفترة</th>
+                    <th className="px-4 py-3 text-center">دائن الفترة</th>
+                    <th className="px-4 py-3 text-center">رصيد آخر المدة</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
@@ -266,14 +268,16 @@ export default function FinancialReports() {
                       <td className="px-4 py-2.5 font-mono text-xs text-slate-500">{row.code}</td>
                       <td className="px-4 py-2.5 text-slate-800">{row.name}</td>
                       <td className="px-4 py-2.5 text-center text-xs text-slate-500">{row.type}</td>
+                      <td className="px-4 py-2.5 text-center font-medium">{row.openingBalance.toFixed(2)}</td>
                       <td className="px-4 py-2.5 text-center font-medium">{row.debit > 0 ? row.debit.toFixed(2) : '—'}</td>
                       <td className="px-4 py-2.5 text-center font-medium">{row.credit > 0 ? row.credit.toFixed(2) : '—'}</td>
+                      <td className="px-4 py-2.5 text-center font-semibold">{row.closingBalance.toFixed(2)}</td>
                     </tr>
                   ))}
                 </tbody>
                 <tfoot className="bg-slate-100 font-bold">
                   <tr>
-                    <td colSpan={3} className="px-4 py-3 text-right">الإجماليات</td>
+                    <td colSpan={4} className="px-4 py-3 text-right">إجماليات الحركة</td>
                     <td className="px-4 py-3 text-center text-blue-700">
                       {data.trialBalance.reduce((s, r) => s + r.debit, 0).toFixed(2)}
                     </td>
