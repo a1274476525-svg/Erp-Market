@@ -783,12 +783,24 @@ function setupIpcHandlers() {
     const order = await prisma.$transaction(async (tx) => {
       const maxOrder = await tx.posOrder.aggregate({ _max: { id: true } })
       const num = String((maxOrder._max.id ?? 0) + 1).padStart(6, '0')
+      const productIds = [...new Set(items.map((item: { productId: number }) => item.productId))]
+      const products = await tx.product.findMany({
+        where: { id: { in: productIds }, isActive: true },
+        select: { id: true, costPrice: true },
+      })
+      const costByProduct = new Map(products.map(product => [product.id, product.costPrice]))
+      if (products.length !== productIds.length) throw new Error('يوجد منتج غير موجود أو غير نشط')
       const o = await tx.posOrder.create({
         data: {
           orderNumber: `ORD-${num}`,
           ...header,
           customerId: customerId || null,
-          items: { create: items },
+          items: {
+            create: items.map((item: { productId: number; quantity: number; unitPrice: number; productName: string; total: number }) => ({
+              ...item,
+              unitCost: costByProduct.get(item.productId) ?? 0,
+            })),
+          },
         },
         include: { items: true },
       })
@@ -914,6 +926,7 @@ function setupIpcHandlers() {
           productName: soldItems[0].productName,
           quantity,
           unitPrice,
+          unitCost: soldItems.reduce((sum, item) => sum + item.unitCost * item.quantity, 0) / soldQuantity,
           total: quantity * unitPrice,
         }
       })
@@ -951,13 +964,8 @@ function setupIpcHandlers() {
         })
       }
       if (cogsAcc && invAcc) {
-        const productIds = [...new Set(ret.items.map(i => i.productId))]
-        const products = await prisma.product.findMany({
-          where: { id: { in: productIds } },
-          select: { id: true, costPrice: true },
-        })
-        const costMap = new Map(products.map(p => [p.id, p.costPrice]))
-        const cost = ret.items.reduce((sum, item) => sum + item.quantity * (costMap.get(item.productId) ?? 0), 0)
+        // Restore inventory at the cost recorded on the original sale lines.
+        const cost = ret.items.reduce((sum, item) => sum + item.quantity * item.unitCost, 0)
         if (cost > 0) {
           await autoJE({
             date: new Date(ret.returnDate),
@@ -1942,14 +1950,9 @@ function setupIpcHandlers() {
     })
 
     if (!cogsAcc || !invAcc) throw new Error('تعذر إيجاد حسابات تكلفة/مخزون البضاعة في دليل الحسابات')
-    const productIds = [...new Set(order.items.map(i => i.productId))]
-    const products   = await prisma.product.findMany({
-      where: { id: { in: productIds } },
-      select: { id: true, costPrice: true },
-    })
-    const costMap = new Map(products.map(p => [p.id, p.costPrice]))
-    let cogs = 0
-    for (const item of order.items) cogs += item.quantity * (costMap.get(item.productId) ?? 0)
+    // Use the immutable sale-time cost snapshot, never today's product cost.
+    // Legacy orders have unitCost=0 and require an explicit historical-cost adjustment.
+    const cogs = order.items.reduce((sum, item) => sum + item.quantity * item.unitCost, 0)
     if (cogs > 0) {
       await autoJE({
         date: new Date(order.createdAt),
