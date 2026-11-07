@@ -2787,74 +2787,115 @@ function setupIpcHandlers() {
   ipcHandle('reports:financial', async (_, { from, to }: { from?: string; to?: string } = {}) => {
     const dateFilter: any = {}
     if (from) { const d = new Date(from); d.setUTCHours(0, 0, 0, 0); dateFilter.gte = d }
-    if (to)   { const d = new Date(to);   d.setUTCDate(d.getUTCDate() + 1); d.setUTCHours(0, 0, 0, 0); dateFilter.lt = d }
+    if (to)   { const d = new Date(to); d.setUTCDate(d.getUTCDate() + 1); d.setUTCHours(0, 0, 0, 0); dateFilter.lt = d }
+    if (from && to && new Date(from) >= new Date(to + 'T23:59:59.999Z')) throw new Error('تاريخ بداية التقرير يجب أن يسبق تاريخ النهاية')
 
-    const salesWhere: any  = { status: 'completed', ...(Object.keys(dateFilter).length ? { createdAt: dateFilter } : {}) }
-    const purWhere: any    = Object.keys(dateFilter).length ? { invoiceDate: dateFilter } : {}
-    const expWhere: any    = Object.keys(dateFilter).length ? { date: dateFilter } : {}
-
-    const [orders, invoices, expenses, bankAccounts, products] = await Promise.all([
-      prisma.posOrder.findMany({ where: salesWhere, include: { items: { include: { product: true } } } }),
-      prisma.purchaseInvoice.findMany({ where: { ...purWhere, status: 'confirmed' }, include: { items: { include: { product: true } } } }),
+    const salesWhere: any = { status: 'completed', ...(Object.keys(dateFilter).length ? { createdAt: dateFilter } : {}) }
+    const purWhere: any = Object.keys(dateFilter).length ? { invoiceDate: dateFilter } : {}
+    const expWhere: any = Object.keys(dateFilter).length ? { date: dateFilter } : {}
+    const [orders, invoices, expenses, bankAccounts, salesReturns, purchaseReturns] = await Promise.all([
+      prisma.posOrder.findMany({ where: salesWhere }),
+      prisma.purchaseInvoice.findMany({ where: { ...purWhere, status: 'confirmed' } }),
       prisma.expense.findMany({ where: expWhere, include: { category: true } }),
       prisma.bankAccount.findMany({ where: { isActive: true } }),
-      prisma.product.findMany({ where: { isActive: true } }),
+      prisma.saleReturn.findMany({ where: Object.keys(dateFilter).length ? { returnDate: dateFilter } : {}, include: { order: true } }),
+      prisma.purchaseReturn.findMany({ where: Object.keys(dateFilter).length ? { returnDate: dateFilter } : {}, include: { invoice: true } }),
     ])
 
-    // VAT detail is sourced from confirmed source documents; financial totals below
-    // are sourced from posted double-entry journals so returns and manual entries
-    // are included and historical COGS does not depend on today's product cost.
-    const totalVatOut = orders.reduce((s, o) => s + o.taxAmount, 0)
-    const totalPurchases = invoices.reduce((s, i) => s + i.subtotal, 0)
-    const totalVatIn = invoices.reduce((s, i) => s + i.taxAmount, 0)
+    const saleReturnTax = salesReturns.reduce((sum, ret) =>
+      sum + (ret.order.subtotal > 0 ? ret.order.taxAmount * ret.total / ret.order.subtotal : 0), 0)
+    const purchaseReturnTax = purchaseReturns.reduce((sum, ret) =>
+      sum + (ret.invoice.subtotal > 0 ? ret.invoice.taxAmount * ret.total / ret.invoice.subtotal : 0), 0)
+    const totalVatOut = orders.reduce((sum, order) => sum + order.taxAmount, 0) - saleReturnTax
+    const totalPurchases = invoices.reduce((sum, invoice) => sum + invoice.subtotal, 0) -
+      purchaseReturns.reduce((sum, ret) => sum + ret.total, 0)
+    const totalVatIn = invoices.reduce((sum, invoice) => sum + invoice.taxAmount, 0) - purchaseReturnTax
 
-    // Trial balance from actual posted journal entries
-    const jeWhere: any = { status: 'posted' }
-    if (Object.keys(dateFilter).length) jeWhere.date = dateFilter
+    // Period trial balance is built only from posted ledger entries.
+    const periodWhere: any = { status: 'posted' }
+    if (Object.keys(dateFilter).length) periodWhere.date = dateFilter
     const glLines = await prisma.journalEntryLine.findMany({
-      where: { entry: jeWhere },
+      where: { entry: periodWhere },
       include: { account: true },
     })
     const tbMap = new Map<number, { account: any; debit: number; credit: number }>()
-    for (const l of glLines) {
-      if (!tbMap.has(l.accountId)) tbMap.set(l.accountId, { account: l.account, debit: 0, credit: 0 })
-      const row = tbMap.get(l.accountId)!
-      row.debit  += l.debit
-      row.credit += l.credit
+    for (const line of glLines) {
+      if (!tbMap.has(line.accountId)) tbMap.set(line.accountId, { account: line.account, debit: 0, credit: 0 })
+      const row = tbMap.get(line.accountId)!
+      row.debit += line.debit
+      row.credit += line.credit
     }
     const trialBalance = Array.from(tbMap.values())
-      .sort((a, b) => a.account.code.localeCompare(b.account.code, undefined, { numeric: true }))
+      .sort((x, y) => x.account.code.localeCompare(y.account.code, undefined, { numeric: true }))
+      .map(row => ({
+        code: row.account.code,
+        name: row.account.name,
+        type: row.account.type,
+        debit: row.debit,
+        credit: row.credit,
+      }))
 
-    // Use posted ledger balances as the source of truth for financial statements.
-    // Account code 5 = cost of sales; code 6 = operating expenses.
     let totalRevenue = 0
     let cogs = 0
     let totalExpenses = 0
     const expByCategory: Record<string, number> = {}
-    let inventoryValue = 0
-    let totalCash = 0
-    let totalBank = 0
-    for (const row of trialBalance) {
+    for (const row of tbMap.values()) {
       const account = row.account
       const netDebit = row.debit - row.credit
       const netCredit = row.credit - row.debit
       if (account.type === 'revenue') totalRevenue += netCredit
       if (account.type === 'expense' && String(account.code).startsWith('52')) cogs += netDebit
       if (account.type === 'expense' && String(account.code).startsWith('6')) {
-        const amount = netDebit
-        totalExpenses += amount
+        totalExpenses += netDebit
         const category = account.name || 'مصروفات تشغيلية'
-        expByCategory[category] = (expByCategory[category] ?? 0) + amount
+        expByCategory[category] = (expByCategory[category] ?? 0) + netDebit
       }
-      if (account.type === 'asset' && String(account.code).startsWith('113')) {
-        inventoryValue += account.normalBalance === 'credit' ? -netCredit : netDebit
-      }
-      if (account.code === '1111') totalCash += account.normalBalance === 'credit' ? -netCredit : netDebit
-      if (account.code === '1112') totalBank += account.normalBalance === 'credit' ? -netCredit : netDebit
     }
     const grossProfit = totalRevenue - cogs
     const netProfit = grossProfit - totalExpenses
     const vatNetPayable = totalVatOut - totalVatIn
+
+    // Balance sheet is an as-of-date statement, not the movement within the selected income-statement period.
+    const balanceDate = to ? new Date(to) : new Date()
+    balanceDate.setUTCDate(balanceDate.getUTCDate() + 1)
+    balanceDate.setUTCHours(0, 0, 0, 0)
+    const [allAccounts, balanceLines] = await Promise.all([
+      prisma.account.findMany({ where: { isActive: true }, orderBy: { code: 'asc' } }),
+      prisma.journalEntryLine.findMany({
+        where: { entry: { status: 'posted', date: { lt: balanceDate } } },
+        select: { accountId: true, debit: true, credit: true },
+      }),
+    ])
+    const balanceMap = new Map<number, { debit: number; credit: number }>()
+    for (const line of balanceLines) {
+      const row = balanceMap.get(line.accountId) ?? { debit: 0, credit: 0 }
+      row.debit += line.debit
+      row.credit += line.credit
+      balanceMap.set(line.accountId, row)
+    }
+    const balanceRows = allAccounts.map(account => {
+      const row = balanceMap.get(account.id) ?? { debit: 0, credit: 0 }
+      const balance = account.type === 'asset' || account.type === 'expense'
+        ? row.debit - row.credit
+        : row.credit - row.debit
+      return { id: account.id, code: account.code, name: account.name, type: account.type, balance }
+    }).filter(row => Math.abs(row.balance) > 0.005)
+
+    const assets = balanceRows.filter(row => row.type === 'asset')
+    const liabilities = balanceRows.filter(row => row.type === 'liability')
+    const equity = balanceRows.filter(row => row.type === 'equity')
+    const balanceRevenue = balanceRows.filter(row => row.type === 'revenue').reduce((sum, row) => sum + row.balance, 0)
+    const balanceExpenses = balanceRows.filter(row => row.type === 'expense').reduce((sum, row) => sum + row.balance, 0)
+    const currentEarnings = balanceRevenue - balanceExpenses
+    const assetsTotal = assets.reduce((sum, row) => sum + row.balance, 0)
+    const liabilitiesTotal = liabilities.reduce((sum, row) => sum + row.balance, 0)
+    const equityTotal = equity.reduce((sum, row) => sum + row.balance, 0) + currentEarnings
+    const liabilitiesAndEquity = liabilitiesTotal + equityTotal
+    const inventoryValue = assets.filter(row => row.code.startsWith('113')).reduce((sum, row) => sum + row.balance, 0)
+    const totalCash = balanceRows.find(row => row.code === '1111')?.balance ?? 0
+    const totalBank = balanceRows.find(row => row.code === '1112')?.balance ?? 0
+    const receivables = assets.filter(row => row.code.startsWith('112')).reduce((sum, row) => sum + row.balance, 0)
+    const payables = liabilities.filter(row => row.code.startsWith('211')).reduce((sum, row) => sum + row.balance, 0)
 
     return {
       period: { from, to },
@@ -2868,6 +2909,15 @@ function setupIpcHandlers() {
       inventory: { value: inventoryValue },
       banks: { cash: totalCash, bank: totalBank, accounts: bankAccounts },
       trialBalance,
+      balanceSheet: {
+        asOf: to ?? new Date().toISOString().slice(0, 10),
+        assets, liabilities, equity,
+        currentEarnings,
+        assetsTotal, liabilitiesTotal, equityTotal, liabilitiesAndEquity,
+        difference: assetsTotal - liabilitiesAndEquity,
+        isBalanced: Math.abs(assetsTotal - liabilitiesAndEquity) <= 0.05,
+        receivables, payables,
+      },
       ordersCount: orders.length,
       invoicesCount: invoices.length,
     }
