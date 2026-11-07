@@ -249,7 +249,7 @@ export default function FinancialReports() {
           {/* Trial Balance */}
           {tab === 'trial' && (
             <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-              <div className="px-4 py-3 bg-slate-800 text-white text-sm font-semibold">ميزان المراجعة (مبسط)</div>
+              <div className="px-4 py-3 bg-slate-800 text-white text-sm font-semibold">ميزان المراجعة</div>
               <table className="w-full text-sm">
                 <thead className="bg-slate-50 text-slate-500 text-xs uppercase">
                   <tr>
@@ -284,11 +284,12 @@ export default function FinancialReports() {
                     <td className="px-4 py-3 text-center text-emerald-700">
                       {data.trialBalance.reduce((s, r) => s + r.credit, 0).toFixed(2)}
                     </td>
+                    <td className="px-4 py-3 text-center">—</td>
                   </tr>
                 </tfoot>
               </table>
               <div className="p-4 bg-amber-50 border-t border-amber-200 text-xs text-amber-700">
-                هذا ميزان مراجعة مبسط يعتمد على عمليات المبيعات والمشتريات والمصاريف. لميزان مراجعة دقيق يجب استخدام نظام محاسبة قيد مزدوج كامل.
+                يعرض التقرير أرصدة أول المدة وحركة الفترة وأرصدة آخر المدة من القيود المحاسبية المرحّلة فقط.
               </div>
             </div>
           )}
