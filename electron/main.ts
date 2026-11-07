@@ -1698,23 +1698,15 @@ function setupIpcHandlers() {
     const amount = Number(data?.amount)
     if (!Number.isFinite(amount) || amount <= 0) throw new Error('يجب إدخال مبلغ مصروف أكبر من صفر')
     if (!Number.isInteger(data?.categoryId) || data.categoryId <= 0) throw new Error('اختر نوع المصروف')
-    const expense = await prisma.expense.create({ data, include: { category: true } })
-
-    try {
+    return prisma.$transaction(async (tx) => {
+      const expense = await tx.expense.create({ data, include: { category: true } })
       await postExpenseJE(
         { id: expense.id, amount: expense.amount, description: expense.description, date: data.date || new Date(), categoryName: expense.category?.name },
         data.paymentMethod,
+        tx,
       )
-    } catch (error) {
-      // Never leave an expense saved without its corresponding ledger posting.
-      // The automatic journal entry is created atomically with its lines, so a
-      // failed posting can be safely compensated by removing this new document.
-      await prisma.expense.delete({ where: { id: expense.id } })
-      console.error('[AutoJE:expense]', error)
-      throw new Error('لم يتم حفظ المصروف لأن ترحيله المحاسبي فشل: ' + (error instanceof Error ? error.message : String(error)))
-    }
-
-    return expense
+      return expense
+    })
   })
 
   ipcHandle('expenses:update', async (_, { id, ...data }) => {
