@@ -3212,7 +3212,8 @@ function setupIpcHandlers() {
     for (const invoice of invoices) {
       const supplierId = invoice.supplierId ?? 0
       if (!map.has(supplierId)) map.set(supplierId, {
-        supplier: invoice.supplier, rows: [], total: 0, c0: 0, c30: 0, c60: 0, c90: 0, count: 0, oldestDueDate: null as Date | null,
+        supplier: invoice.supplier, name: invoice.supplier?.name ?? 'مورد غير محدد',
+        rows: [], total: 0, c0: 0, c30: 0, c60: 0, c90: 0, count: 0, oldestDueDate: null as Date | null,
       })
       const entry = map.get(supplierId)!
       const paid = invoice.payments.reduce((sum, payment) => sum + payment.amount, 0)
@@ -3239,7 +3240,8 @@ function setupIpcHandlers() {
       .filter(entry => entry.total > 0.005)
       .map(entry => ({
         ...entry,
-        days: entry.oldestDueDate ? Math.max(0, Math.floor((cutoff.getTime() - entry.oldestDueDate.getTime()) / 86400000) - 1) : 0,
+        lastDate: entry.oldestDueDate,
+        days: entry.oldestDueDate ? Math.max(0, Math.floor((cutoff.getTime() - 1 - entry.oldestDueDate.getTime()) / 86400000)) : 0,
       }))
       .sort((a, b) => b.total - a.total)
   })
