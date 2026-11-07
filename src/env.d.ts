@@ -155,6 +155,7 @@ interface Window {
     }
     expenseCategories: {
       getAll:  () => Promise<any[]>
+      getAccounts: () => Promise<{ id: number; code: string; name: string }[]>
       create:  (data: any) => Promise<any>
       update:  (data: any) => Promise<any>
       delete:  (id: number) => Promise<any>
