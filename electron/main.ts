@@ -1871,7 +1871,7 @@ function setupIpcHandlers() {
     for (const acc of STANDARD_ACCOUNTS) {
       if (idByCode.has(acc.code)) continue
       const parentId = acc.p ? (idByCode.get(acc.p) ?? null) : null
-      const record = await prisma.account.create({
+      const record = await db.account.create({
         data: { code: acc.code, name: acc.name, type: acc.type, normalBalance: acc.nb, level: acc.level, parentId },
       })
       idByCode.set(acc.code, record.id)
