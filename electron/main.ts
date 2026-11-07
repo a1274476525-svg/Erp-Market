@@ -2763,6 +2763,7 @@ function setupIpcHandlers() {
     }
     const start = dateRange(from)
     const end = dateRange(to, true)
+    if (start && end && start >= end) throw new Error('تاريخ البداية يجب أن يسبق تاريخ النهاية')
     const orderWhere: any = { customerId: id, status: 'completed', paymentMethod: 'credit' }
     const paymentWhere: any = { customerId: id }
     const returnWhere: any = { order: { customerId: id, paymentMethod: 'credit', status: 'completed' } }
@@ -2823,6 +2824,7 @@ function setupIpcHandlers() {
     }
     const start = dateRange(from)
     const end = dateRange(to, true)
+    if (start && end && start >= end) throw new Error('تاريخ البداية يجب أن يسبق تاريخ النهاية')
     const invoiceWhere: any = { supplierId: id, status: 'confirmed' }
     const paymentWhere: any = { supplierId: id }
     if (start) { invoiceWhere.invoiceDate = { gte: start, ...(end ? { lt: end } : {}) }; paymentWhere.date = { gte: start, ...(end ? { lt: end } : {}) } }
