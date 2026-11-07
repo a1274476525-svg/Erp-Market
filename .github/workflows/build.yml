@@ -5,9 +5,11 @@ on:
     branches:
       - main
       - "fix/**"
+      - "accounting/**"
   pull_request:
     branches:
       - main
+      - "accounting/**"
 
 jobs:
   build:
@@ -25,8 +27,8 @@ jobs:
       - name: Generate Prisma client
         run: npx prisma generate
         env:
-          DATABASE_URL: file:./prisma/umarket.db
+          DATABASE_URL: file:./umarket.db
       - name: Type-check and build renderer and Electron
         run: npm run build
         env:
-          DATABASE_URL: file:./prisma/umarket.db
+          DATABASE_URL: file:./umarket.db
