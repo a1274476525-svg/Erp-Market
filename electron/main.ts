@@ -2238,9 +2238,9 @@ function setupIpcHandlers() {
       findAccByCode('61', db), findAccByCode('1111', db), findAccByCode('1112', db),
     ])
     const mappedExpenseAcc = expense.categoryAccountId
-      ? await db.account.findUnique({ where: { id: expense.categoryAccountId }, select: { id: true, type: true, isActive: true } })
+      ? await db.account.findUnique({ where: { id: expense.categoryAccountId }, select: { id: true, code: true, type: true, isActive: true } })
       : null
-    if (expense.categoryAccountId && (!mappedExpenseAcc || mappedExpenseAcc.type !== 'expense' || !mappedExpenseAcc.isActive)) {
+    if (expense.categoryAccountId && (!mappedExpenseAcc || mappedExpenseAcc.type !== 'expense' || !mappedExpenseAcc.isActive || !mappedExpenseAcc.code.startsWith('6'))) {
       throw new Error('الحساب المرتبط بنوع المصروف غير نشط أو ليس حساب مصروفات')
     }
     const expAcc = mappedExpenseAcc ?? defaultExpenseAcc
