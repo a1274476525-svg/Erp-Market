@@ -25,6 +25,7 @@ import PromotionsPage   from './pages/Promotions'
 import SuppliersPage    from './pages/Suppliers'
 import PurchaseRequestsPage from './pages/PurchaseRequests'
 import PurchaseInvoicesPage from './pages/PurchaseInvoices'
+import PurchaseReturnsPage from './pages/PurchaseReturns'
 import StockMovementsPage   from './pages/StockMovements'
 import WasteTrackingPage    from './pages/WasteTracking'
 import InventoryCountPage   from './pages/InventoryCount'
@@ -148,6 +149,7 @@ function Sidebar() {
           { to: '/suppliers',         label: 'الموردون',       icon: Truck },
           { to: '/purchase-requests', label: 'طلبات الشراء',  icon: ClipboardList },
           { to: '/invoices',          label: 'فواتير الشراء', icon: FileText },
+          { to: '/purchase-returns',   label: 'مرتجعات المشتريات', icon: RotateCcw },
         ]} />
 
         <div className="border-t border-slate-800 pt-1" />
@@ -248,6 +250,7 @@ function AppContent() {
             <Route path="/suppliers"          element={<ProtectedRoute path="/suppliers"          element={<SuppliersPage />} />} />
             <Route path="/purchase-requests"  element={<ProtectedRoute path="/purchase-requests"  element={<PurchaseRequestsPage />} />} />
             <Route path="/invoices"           element={<ProtectedRoute path="/invoices"           element={<PurchaseInvoicesPage />} />} />
+            <Route path="/purchase-returns" element={<ProtectedRoute path="/purchase-returns" element={<PurchaseReturnsPage />} />} />
             <Route path="/stock"              element={<ProtectedRoute path="/stock"              element={<StockMovementsPage />} />} />
             <Route path="/waste"              element={<ProtectedRoute path="/waste"              element={<WasteTrackingPage />} />} />
             <Route path="/inventory"          element={<ProtectedRoute path="/inventory"          element={<InventoryCountPage />} />} />
