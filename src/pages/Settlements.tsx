@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { RefreshCw, Wallet, Receipt, Truck, CheckCircle2 } from 'lucide-react'
 
 type Mode = 'customers' | 'suppliers'
@@ -80,7 +80,7 @@ export default function SettlementsPage() {
     setSuccess('')
   }
 
-  async function submit(e: React.FormEvent) {
+  async function submit(e: FormEvent) {
     e.preventDefault()
     if (!selected) return
     const value = Number(amount)
