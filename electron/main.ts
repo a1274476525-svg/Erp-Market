@@ -751,8 +751,15 @@ function setupIpcHandlers() {
         if (!Number.isFinite(item.quantity) || item.quantity <= 0 || !Number.isFinite(item.unitPrice) || item.unitPrice < 0) {
           throw new Error('بيانات صنف في فاتورة الشراء غير صالحة')
         }
+        const productCost = await tx.product.findUnique({ where: { id: item.productId }, select: { costPrice: true } })
+        if (!productCost) throw new Error('المنتج غير موجود')
+        const stockBefore = await tx.warehouseStock.aggregate({ where: { productId: item.productId }, _sum: { quantity: true } })
+        const quantityBefore = stockBefore._sum.quantity ?? 0
+        const weightedAverageCost = quantityBefore + item.quantity > 0
+          ? ((quantityBefore * productCost.costPrice) + (item.quantity * item.unitPrice)) / (quantityBefore + item.quantity)
+          : item.unitPrice
         await changeWarehouseStock(tx, warehouse.id, item.productId, item.quantity)
-        await tx.product.update({ where: { id: item.productId }, data: { costPrice: item.unitPrice } })
+        await tx.product.update({ where: { id: item.productId }, data: { costPrice: weightedAverageCost } })
         await tx.stockMovement.create({
           data: { productId: item.productId, quantity: item.quantity, type: 'purchase', referenceId: inv.id },
         })
@@ -1057,11 +1064,13 @@ function setupIpcHandlers() {
       }
 
       await ensureStandardAccounts(tx)
-      const [salesAcc, cashAcc, bankAcc, vatAcc, cogsAcc, invAcc] = await Promise.all([
-        findAccByCode('4111', tx), findAccByCode('1111', tx), findAccByCode('1112', tx),
+      const [salesAcc, cashAcc, bankAcc, receivableAcc, vatAcc, cogsAcc, invAcc] = await Promise.all([
+        findAccByCode('412', tx), findAccByCode('1111', tx), findAccByCode('1112', tx), findAccByCode('1121', tx),
         findAccByCode('2121', tx), findAccByCode('521', tx), findAccByCode('1131', tx),
       ])
-      const refundAcc = order.paymentMethod === 'cash' ? cashAcc : bankAcc
+      const refundAcc = order.paymentMethod === 'credit'
+        ? receivableAcc
+        : order.paymentMethod === 'cash' ? cashAcc : bankAcc
       if (!salesAcc || !refundAcc || !cogsAcc || !invAcc) {
         throw new Error('تعذر إيجاد حسابات مرتجع المبيعات والنقدية/البنك والمخزون والتكلفة')
       }
