@@ -644,14 +644,9 @@ function setupIpcHandlers() {
           data: { productId: item.productId, quantity: item.quantity, type: 'purchase', referenceId: inv.id },
         })
       }
+      await postPurchaseInvoiceJE(inv, tx)
       return inv
     })
-
-    try {
-      await postPurchaseInvoiceJE(invoice)
-    } catch (e) {
-      console.error('[AutoJE:purchase]', e)
-    }
 
     return invoice
   })
@@ -690,21 +685,16 @@ function setupIpcHandlers() {
       if (!inv) throw new Error('الفاتورة غير موجودة')
       const warehouse = await getDefaultWarehouse(tx)
       for (const item of inv.items) {
-        if (!Number.isFinite(item.quantity) || item.quantity <= 0) throw new Error('كمية شراء غير صالحة')
+        if (!Number.isFinite(item.quantity) || item.quantity <= 0 || !Number.isFinite(item.unitPrice) || item.unitPrice < 0) throw new Error('بيانات صنف شراء غير صالحة')
         await changeWarehouseStock(tx, warehouse.id, item.productId, item.quantity)
         await tx.product.update({ where: { id: item.productId }, data: { costPrice: item.unitPrice } })
         await tx.stockMovement.create({
           data: { productId: item.productId, quantity: item.quantity, type: 'purchase', referenceId: id },
         })
       }
+      await postPurchaseInvoiceJE(inv, tx)
       return inv
     })
-
-    try {
-      await postPurchaseInvoiceJE(invoice)
-    } catch (e) {
-      console.error('[AutoJE:purchase]', e)
-    }
 
     return invoice
   })
@@ -817,14 +807,10 @@ function setupIpcHandlers() {
         const pts = Math.floor(o.total / 10)
         if (pts > 0) await tx.customer.update({ where: { id: customerId }, data: { loyaltyPoints: { increment: pts } } })
       }
+      // The order, stock movements, loyalty points and ledger postings commit together.
+      await postSaleJE(o, tx)
       return o
     })
-
-    try {
-      await postSaleJE(order)
-    } catch (e) {
-      console.error('[AutoJE:sale]', e)
-    }
 
     return order
   })
