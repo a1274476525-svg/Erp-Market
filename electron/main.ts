@@ -3120,6 +3120,66 @@ function setupIpcHandlers() {
     }
   })
 
+  ipcHandle('reports:generalLedger', async (_, { accountId, from, to }: { accountId?: number; from?: string; to?: string } = {}) => {
+    const accounts = await prisma.account.findMany({
+      where: { isActive: true, children: { none: {} } },
+      select: { id: true, code: true, name: true, type: true, normalBalance: true },
+      orderBy: { code: 'asc' },
+    })
+    if (accountId == null) return { accounts, selectedAccount: null, openingBalance: 0, rows: [], totalDebit: 0, totalCredit: 0, closingBalance: 0 }
+    const id = Number(accountId)
+    if (!Number.isInteger(id) || id <= 0) throw new Error('اختر حسابًا صحيحًا')
+    const account = accounts.find(row => row.id === id)
+    if (!account) throw new Error('الحساب غير موجود أو غير نشط أو ليس حسابًا تفصيليًا')
+    const dateValue = (value: string, end = false) => {
+      if (!value) return undefined
+      const date = new Date(value)
+      if (Number.isNaN(date.getTime())) throw new Error('تاريخ التقرير غير صحيح')
+      if (end) { date.setUTCDate(date.getUTCDate() + 1); date.setUTCHours(0, 0, 0, 0) }
+      else date.setUTCHours(0, 0, 0, 0)
+      return date
+    }
+    const start = from ? dateValue(from) : undefined
+    const end = to ? dateValue(to, true) : undefined
+    if (start && end && start >= end) throw new Error('تاريخ البداية يجب أن يسبق تاريخ النهاية')
+    const [opening, lines] = await Promise.all([
+      start ? prisma.journalEntryLine.aggregate({
+        where: { accountId: id, entry: { status: 'posted', date: { lt: start } } },
+        _sum: { debit: true, credit: true },
+      }) : Promise.resolve({ _sum: { debit: 0, credit: 0 } }),
+      prisma.journalEntryLine.findMany({
+        where: {
+          accountId: id,
+          entry: {
+            status: 'posted',
+            ...(start || end ? { date: { ...(start ? { gte: start } : {}), ...(end ? { lt: end } : {}) } } : {}),
+          },
+        },
+        include: { entry: { select: { id: true, number: true, date: true, description: true, reference: true, source: true } } },
+        orderBy: [{ entry: { date: 'asc' } }, { entryId: 'asc' }, { id: 'asc' }],
+      }),
+    ])
+    const normal = account.normalBalance === 'credit' ? -1 : 1
+    const openingBalance = normal * ((opening._sum.debit ?? 0) - (opening._sum.credit ?? 0))
+    let running = openingBalance
+    const rows = lines.map(line => {
+      const debit = line.debit ?? 0
+      const credit = line.credit ?? 0
+      running += normal * (debit - credit)
+      return {
+        id: line.id, date: line.entry.date, entryNumber: line.entry.number,
+        description: line.description || line.entry.description || line.entry.reference || 'قيد محاسبي',
+        source: line.entry.source, debit, credit, balance: running,
+      }
+    })
+    return {
+      accounts, selectedAccount: account, openingBalance, rows,
+      totalDebit: rows.reduce((sum, row) => sum + row.debit, 0),
+      totalCredit: rows.reduce((sum, row) => sum + row.credit, 0),
+      closingBalance: running,
+    }
+  })
+
   ipcHandle('reports:cashFlow', async (_, { from, to }: any = {}) => {
     const dateFilter: any = {}
     if (from) { const d = new Date(from); d.setUTCHours(0, 0, 0, 0); dateFilter.gte = d }
