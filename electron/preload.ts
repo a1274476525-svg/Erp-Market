@@ -128,6 +128,7 @@ contextBridge.exposeInMainWorld('api', {
     products:           ()            => ipcRenderer.invoke('reports:products'),
     stock:              ()            => ipcRenderer.invoke('reports:stock'),
     financial:          (params: any) => ipcRenderer.invoke('reports:financial', params),
+    generalLedger:      (params: any) => ipcRenderer.invoke('reports:generalLedger', params),
     customerStatement:  (params: any) => ipcRenderer.invoke('reports:customerStatement', params),
     supplierStatement:  (params: any) => ipcRenderer.invoke('reports:supplierStatement', params),
     vatDetails:         (params: any) => ipcRenderer.invoke('reports:vatDetails', params),
