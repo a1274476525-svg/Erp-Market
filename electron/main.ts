@@ -2872,8 +2872,12 @@ function setupIpcHandlers() {
   })
 
   // ─── SYSTEM ─────────────────────────────────────────────────────
-  ipcHandle('system:clearAllData', async (_, payload: { sections: string[]; userId: number; pin: string }) => {
+  ipcHandle('system:clearAllData', async (event, payload: { sections: string[]; userId: number; pin: string }) => {
     const { sections, userId, pin } = payload || {}
+    const sessionUserId = authenticatedSessions.get(event.sender.id)
+    if (!sessionUserId || sessionUserId !== userId) {
+      throw new Error('انتهت جلسة الدخول أو أن المستخدم لا يطابق الجلسة الحالية. سجل الدخول مرة أخرى')
+    }
     if (!Array.isArray(sections) || sections.length === 0) {
       throw new Error('اختر قسمًا واحدًا على الأقل')
     }
