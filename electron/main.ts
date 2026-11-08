@@ -612,11 +612,15 @@ function setupIpcHandlers() {
     if (Number.isNaN(paymentDate.getTime())) throw new Error('تاريخ التحصيل غير صحيح')
 
     return prisma.$transaction(async (tx) => {
-      const order = await tx.posOrder.findUnique({ where: { id: data.orderId } })
+      const order = await tx.posOrder.findUnique({ where: { id: data.orderId }, include: { returns: true } })
       if (!order || order.status !== 'completed' || !order.customerId) throw new Error('الفاتورة الآجلة أو العميل غير موجود')
       if (order.paymentMethod !== 'credit') throw new Error('هذه الفاتورة ليست مسجلة على الحساب')
       const paid = await tx.customerPayment.aggregate({ where: { orderId: order.id }, _sum: { amount: true } })
-      const outstanding = Math.max(0, order.total - (paid._sum.amount ?? 0))
+      const returned = order.returns.reduce((sum, ret) => {
+        const ratio = order.subtotal > 0 ? ret.total / order.subtotal : 0
+        return sum + ret.total - Number(order.discountAmount ?? 0) * ratio + Number(order.taxAmount ?? 0) * ratio
+      }, 0)
+      const outstanding = Math.max(0, order.total - (paid._sum.amount ?? 0) - returned)
       if (amount > outstanding + 0.005) throw new Error(`مبلغ التحصيل أكبر من المتبقي: ${outstanding.toFixed(2)}`)
 
       await ensureStandardAccounts(tx)
@@ -689,7 +693,14 @@ function setupIpcHandlers() {
       const invoice = await tx.purchaseInvoice.findUnique({ where: { id: data.invoiceId } })
       if (!invoice || invoice.status !== 'confirmed' || !invoice.supplierId) throw new Error('فاتورة المورد غير موجودة أو غير مرتبطة بمورد')
       const paid = await tx.supplierPayment.aggregate({ where: { invoiceId: invoice.id }, _sum: { amount: true } })
-      const outstanding = Math.max(0, invoice.total - (paid._sum.amount ?? 0))
+      const returns = await tx.purchaseReturn.findMany({ where: { invoiceId: invoice.id }, select: { total: true } })
+      const returned = returns.reduce((sum, ret) => {
+        const taxShare = invoice.subtotal > 0
+          ? Math.round(invoice.taxAmount * ret.total / invoice.subtotal * 100) / 100
+          : 0
+        return sum + ret.total + taxShare
+      }, 0)
+      const outstanding = Math.max(0, invoice.total - (paid._sum.amount ?? 0) - returned)
       if (amount > outstanding + 0.005) throw new Error(`مبلغ السداد أكبر من المتبقي: ${outstanding.toFixed(2)}`)
 
       await ensureStandardAccounts(tx)
@@ -1058,7 +1069,7 @@ function setupIpcHandlers() {
 
   ipcHandle('pos:getOrders', (_, limit = 100) =>
     prisma.posOrder.findMany({
-      include: { items: { include: { product: true } }, customer: true, payments: true },
+      include: { items: { include: { product: true } }, customer: true, payments: true, returns: { select: { total: true } } },
       orderBy: { createdAt: 'desc' },
       take: limit,
     })
