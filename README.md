@@ -22,24 +22,36 @@
 
 ## تشغيل المشروع للمطورين
 
-يتطلب Node.js 20 أو أحدث.
+يتطلب Node.js 20 أو أحدث، ويجب تنفيذ الأوامر من مجلد المشروع الذي يحتوي على `package.json`.
+
+### Windows PowerShell
+
+```powershell
+npm ci
+$env:DATABASE_URL = "file:./umarket.db"
+npm run db:generate
+npm run db:push
+npm run dev
+```
+
+يبقى متغير `DATABASE_URL` مضبوطًا طوال جلسة PowerShell الحالية. إذا أغلقت النافذة وفتحت أخرى، اضبطه مرة ثانية قبل أوامر Prisma.
+
+### macOS / Linux
 
 ```bash
 npm ci
-npx prisma generate
-```
-
-إنشاء قاعدة SQLite محلية أول مرة:
-
-```bash
-# من جذر المشروع
-DATABASE_URL="file:./umarket.db" npx prisma db push
-```
-
-تشغيل وضع التطوير:
-
-```bash
+export DATABASE_URL="file:./umarket.db"
+npm run db:generate
+npm run db:push
 npm run dev
+```
+
+> استخدم أوامر `npm run db:generate` و`npm run db:push` الموجودة في المشروع بعد `npm ci`، بدل تشغيل Prisma من تثبيت عابر عبر `npx`. لا تنفّذ `db:push` على قاعدة بيانات العمل قبل أخذ نسخة احتياطية. مسار `file:./umarket.db` يُحل بالنسبة إلى ملف Prisma schema داخل مجلد `prisma`.
+
+بناء مثبت Windows محليًا:
+
+```powershell
+npm run dist:win
 ```
 
 بناء مثبت Windows محليًا:
