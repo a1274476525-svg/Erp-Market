@@ -3258,7 +3258,7 @@ function setupIpcHandlers() {
       orderBy: { name: 'asc' },
     })
     const result = customers.map(customer => {
-      const entry: any = { id: customer.id, name: customer.name, phone: customer.phone, rows: [], total: 0, c0: 0, c30: 0, c60: 0, c90: 0, count: 0, oldestDueDate: null as Date | null, lastDate: null as Date | null, lastDate: null as Date | null }
+      const entry: any = { id: customer.id, name: customer.name, phone: customer.phone, rows: [], total: 0, c0: 0, c30: 0, c60: 0, c90: 0, count: 0, oldestDueDate: null as Date | null, lastDate: null as Date | null }
       for (const order of customer.orders) {
         const paid = order.payments.reduce((sum, payment) => sum + payment.amount, 0)
         const returned = order.returns.reduce((sum, ret) => {
