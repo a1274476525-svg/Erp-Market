@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { TrendingUp, TrendingDown, Scale, FileText, Receipt, RefreshCw, Download } from 'lucide-react'
+import { TrendingUp, TrendingDown, Scale, FileText, Receipt, RefreshCw, Download, BookOpen } from 'lucide-react'
 import * as XLSX from 'xlsx'
 import { useSettings } from '../contexts/SettingsContext'
 
@@ -34,13 +34,14 @@ interface FinancialData {
   invoicesCount: number
 }
 
-type ReportTab = 'income' | 'balance' | 'trial' | 'vat'
+type ReportTab = 'income' | 'balance' | 'trial' | 'vat' | 'ledger'
 
 const TAB_LABELS: Record<ReportTab, string> = {
   income:  'قائمة الدخل',
   balance: 'الميزانية العمومية',
   trial:   'ميزان المراجعة',
   vat:     'تقرير الضرائب',
+  ledger:  'دفتر الأستاذ',
 }
 
 function StatCard({ label, value, currency, sub, color = 'slate' }: {
@@ -79,6 +80,9 @@ export default function FinancialReports() {
   const [data, setData]     = useState<FinancialData | null>(null)
   const [loading, setLoading] = useState(false)
   const [tab, setTab]       = useState<ReportTab>('income')
+  const [ledgerAccountId, setLedgerAccountId] = useState<number | ''>('')
+  const [ledgerData, setLedgerData] = useState<any>(null)
+  const [ledgerLoading, setLedgerLoading] = useState(false)
   const { settings }        = useSettings()
   const cur                 = settings.currency
 
@@ -92,6 +96,23 @@ export default function FinancialReports() {
   }, [from, to])
 
   useEffect(() => { load() }, [load])
+
+  useEffect(() => {
+    if (tab !== 'ledger') return
+    let active = true
+    setLedgerLoading(true)
+    window.api.reports.generalLedger({
+      accountId: ledgerAccountId === '' ? undefined : ledgerAccountId,
+      from, to,
+    }).then(result => {
+      if (active) setLedgerData(result)
+    }).catch((error: any) => {
+      if (active) alert(error?.message || 'تعذر تحميل دفتر الأستاذ')
+    }).finally(() => {
+      if (active) setLedgerLoading(false)
+    })
+    return () => { active = false }
+  }, [tab, ledgerAccountId, from, to])
 
   function exportCurrentFinancialReport() {
     if (!data) return
@@ -130,6 +151,16 @@ export default function FinancialReports() {
       rows.push(['كود الحساب', 'الحساب', 'النوع', 'رصيد أول المدة', 'مدين الفترة', 'دائن الفترة', 'رصيد آخر المدة'])
       data.trialBalance.forEach(row => rows.push([row.code, row.name, row.type, row.openingBalance, row.debit, row.credit, row.closingBalance]))
       rows.push(['', 'الإجمالي', '', '', data.trialBalance.reduce((sum, row) => sum + row.debit, 0), data.trialBalance.reduce((sum, row) => sum + row.credit, 0), ''])
+    } else if (tab === 'ledger') {
+      if (!ledgerData?.selectedAccount) return
+      rows.push(['الحساب', ledgerData.selectedAccount.code + ' — ' + ledgerData.selectedAccount.name])
+      rows.push(['رصيد أول المدة', ledgerData.openingBalance])
+      rows.push(['التاريخ', 'رقم القيد', 'البيان', 'مدين', 'دائن', 'الرصيد'])
+      ledgerData.rows.forEach((row: any) => rows.push([
+        new Date(row.date).toLocaleDateString('ar-EG'), row.entryNumber, row.description,
+        row.debit, row.credit, row.balance,
+      ]))
+      rows.push(['', '', 'إجماليات الحركة', ledgerData.totalDebit, ledgerData.totalCredit, ledgerData.closingBalance])
     } else {
       rows.push(['البند', 'القيمة'])
       rows.push(['وعاء مبيعات', data.revenue.total])
@@ -193,10 +224,65 @@ export default function FinancialReports() {
                 {t === 'balance' && <Scale size={15} />}
                 {t === 'trial'   && <FileText size={15} />}
                 {t === 'vat'     && <Receipt size={15} />}
+                {t === 'ledger'  && <BookOpen size={15} />}
                 {TAB_LABELS[t]}
               </button>
             ))}
           </div>
+
+          {tab === 'ledger' && (
+            <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+              <div className="p-4 border-b flex flex-wrap items-center gap-3 justify-between">
+                <div>
+                  <h2 className="font-semibold text-slate-800">دفتر الأستاذ العام</h2>
+                  <p className="text-xs text-slate-500 mt-1">حركة الحساب التفصيلي والأرصدة الجارية من القيود المرحلة فقط</p>
+                </div>
+                <select value={ledgerAccountId} onChange={e => setLedgerAccountId(e.target.value ? Number(e.target.value) : '')}
+                  className="min-w-64 border rounded-lg px-3 py-2 text-sm bg-white">
+                  <option value="">اختر حسابًا تفصيليًا</option>
+                  {(ledgerData?.accounts ?? []).map((account: any) => (
+                    <option key={account.id} value={account.id}>{account.code} — {account.name}</option>
+                  ))}
+                </select>
+              </div>
+              {ledgerLoading ? <div className="p-8 text-center text-slate-400">جارٍ تحميل دفتر الأستاذ...</div> :
+                !ledgerData?.selectedAccount ? <div className="p-8 text-center text-slate-400">اختر حسابًا لعرض حركته خلال الفترة المحددة</div> : (
+                  <>
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3 p-4 bg-slate-50">
+                      <div><div className="text-xs text-slate-500">رصيد أول المدة</div><b>{ledgerData.openingBalance.toFixed(2)} {cur}</b></div>
+                      <div><div className="text-xs text-slate-500">إجمالي المدين</div><b className="text-blue-700">{ledgerData.totalDebit.toFixed(2)} {cur}</b></div>
+                      <div><div className="text-xs text-slate-500">إجمالي الدائن</div><b className="text-emerald-700">{ledgerData.totalCredit.toFixed(2)} {cur}</b></div>
+                      <div><div className="text-xs text-slate-500">رصيد آخر المدة</div><b>{ledgerData.closingBalance.toFixed(2)} {cur}</b></div>
+                    </div>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-sm min-w-[760px]">
+                        <thead className="bg-slate-50 text-slate-500">
+                          <tr>
+                            <th className="p-3 text-right">التاريخ</th><th className="p-3 text-right">رقم القيد</th>
+                            <th className="p-3 text-right">البيان</th><th className="p-3 text-center">مدين</th>
+                            <th className="p-3 text-center">دائن</th><th className="p-3 text-center">الرصيد الجاري</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y">
+                          <tr className="bg-amber-50"><td className="p-3" colSpan={3}>رصيد أول المدة</td><td className="p-3 text-center">—</td><td className="p-3 text-center">—</td><td className="p-3 text-center font-semibold">{ledgerData.openingBalance.toFixed(2)}</td></tr>
+                          {ledgerData.rows.map((row: any) => (
+                            <tr key={row.id} className="hover:bg-slate-50">
+                              <td className="p-3">{new Date(row.date).toLocaleDateString('ar-EG')}</td>
+                              <td className="p-3 font-mono text-xs">{row.entryNumber}</td>
+                              <td className="p-3">{row.description}</td>
+                              <td className="p-3 text-center">{row.debit ? row.debit.toFixed(2) : '—'}</td>
+                              <td className="p-3 text-center">{row.credit ? row.credit.toFixed(2) : '—'}</td>
+                              <td className="p-3 text-center font-semibold">{row.balance.toFixed(2)}</td>
+                            </tr>
+                          ))}
+                          {ledgerData.rows.length === 0 && <tr><td colSpan={6} className="p-8 text-center text-slate-400">لا توجد حركة مرحلة لهذا الحساب في الفترة المحددة</td></tr>}
+                        </tbody>
+                      </table>
+                    </div>
+                  </>
+                )}
+            </div>
+          )}
 
           {/* Income Statement */}
           {tab === 'income' && (
