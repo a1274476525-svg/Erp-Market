@@ -105,10 +105,19 @@ async function ensureSystemRole() {
       data: { name: 'مدير النظام', fullAccess: true, permissions: '[]', isSystem: true },
     })
   }
+
+  // Never promote users with missing/renamed roles to system administrator.
+  // Keep their accounts usable for login, but give them no permissions until
+  // an administrator explicitly assigns a valid role.
+  const fallbackRole = await prisma.role.upsert({
+    where: { name: 'مستخدم بلا صلاحيات' },
+    update: { fullAccess: false, permissions: '[]', isSystem: false },
+    create: { name: 'مستخدم بلا صلاحيات', fullAccess: false, permissions: '[]', isSystem: false },
+  })
   const knownNames = (await prisma.role.findMany({ select: { name: true } })).map(r => r.name)
   await prisma.user.updateMany({
     where: { role: { notIn: knownNames } },
-    data:  { role: sysRole.name },
+    data:  { role: fallbackRole.name },
   })
 }
 
@@ -339,13 +348,13 @@ function setupIpcHandlers() {
       if (!role) throw new Error('دور المستخدم غير موجود')
 
       const action = channel.split(':')[1] ?? ''
-      if (mutatingActions.has(action) && !role.fullAccess) {
+      if (mutatingActions.has(action) && !role.fullAccess && channel !== 'activity:log') {
         const allowedPaths = permissionPaths(channel)
-        if (allowedPaths.length > 0 && !allowedPaths.some(path =>
+        const hasPermission = allowedPaths.length > 0 && allowedPaths.some(path =>
           role.permissions.some(permission => path === permission || path.startsWith(permission + '/'))
-        )) {
-          throw new Error('ليس لديك صلاحية لتنفيذ هذه العملية')
-        }
+        )
+        // Fail closed: an unmapped mutation must never become implicitly allowed.
+        if (!hasPermission) throw new Error('ليس لديك صلاحية لتنفيذ هذه العملية')
       }
       return handler(event, ...args)
     })
