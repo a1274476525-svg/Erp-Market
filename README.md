@@ -54,11 +54,6 @@ npm run dev
 npm run dist:win
 ```
 
-بناء مثبت Windows محليًا:
-
-```bash
-npm run dist:win
-```
 
 ## التقنية
 
