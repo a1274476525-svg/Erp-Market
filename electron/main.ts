@@ -3094,38 +3094,82 @@ function setupIpcHandlers() {
     }
   })
 
-  ipcHandle('reports:arAging', async (_, { asOf }: any = {}) => {
+  ipcHandle('reports:arAging', async (_, { asOf }: { asOf?: string } = {}) => {
     const cutoff = asOf ? new Date(asOf) : new Date()
+    if (Number.isNaN(cutoff.getTime())) throw new Error('تاريخ تقرير أعمار الديون غير صحيح')
+    cutoff.setUTCHours(23, 59, 59, 999)
     const customers = await prisma.customer.findMany({
-      include: { orders: { where: { status: 'completed' }, orderBy: { createdAt: 'desc' } } },
+      include: {
+        orders: {
+          where: { status: 'completed', paymentMethod: 'credit' },
+          include: { payments: true, returns: true },
+          orderBy: { createdAt: 'desc' },
+        },
+      },
+      orderBy: { name: 'asc' },
     })
-    return customers.filter(c => c.orders.length > 0).map(c => {
-      const last = c.orders[0]
-      const days = Math.floor((cutoff.getTime() - new Date(last.createdAt).getTime()) / 86400000)
-      const total = c.orders.reduce((s, o) => s + o.total, 0)
-      return { id: c.id, name: c.name, phone: c.phone, total, lastDate: last.createdAt, days, count: c.orders.length }
-    }).sort((a, b) => b.total - a.total)
+    const result = customers.map(customer => {
+      const rows = customer.orders.map(order => {
+        const paid = order.payments.reduce((sum, payment) => sum + payment.amount, 0)
+        const returned = order.returns.reduce((sum, ret) => {
+          const ratio = order.subtotal > 0 ? ret.total / order.subtotal : 0
+          return sum + ret.total - Number(order.discountAmount ?? 0) * ratio + Number(order.taxAmount ?? 0) * ratio
+        }, 0)
+        const due = Math.max(0, order.total - paid - returned)
+        const days = Math.max(0, Math.floor((cutoff.getTime() - new Date(order.createdAt).getTime()) / 86400000))
+        return { id: order.id, orderNumber: order.orderNumber, date: order.createdAt, total: order.total, paid, returned, due, days }
+      }).filter(row => row.due > 0.005)
+      const total = rows.reduce((sum, row) => sum + row.due, 0)
+      const bucket = (days: number) => days <= 30 ? 'c0' : days <= 60 ? 'c30' : days <= 90 ? 'c60' : 'c90'
+      const aging = { c0: 0, c30: 0, c60: 0, c90: 0 }
+      for (const row of rows) aging[bucket(row.days) as keyof typeof aging] += row.due
+      const oldest = rows.reduce<Date | null>((value, row) => !value || new Date(row.date) < value ? new Date(row.date) : value, null)
+      const latest = rows.reduce<Date | null>((value, row) => !value || new Date(row.date) > value ? new Date(row.date) : value, null)
+      const oldestDueDate = oldest
+      const lastDate = latest
+      const days = latest ? Math.max(0, Math.floor((cutoff.getTime() - latest.getTime()) / 86400000)) : 0
+      return { id: customer.id, name: customer.name, phone: customer.phone, rows, total, ...aging, lastDate, oldestDueDate, days, count: rows.length }
+    }).filter(customer => customer.total > 0.005)
+    return result.sort((a, b) => b.total - a.total)
   })
 
-  ipcHandle('reports:apAging', async (_, { asOf }: any = {}) => {
+  ipcHandle('reports:apAging', async (_, { asOf }: { asOf?: string } = {}) => {
     const cutoff = asOf ? new Date(asOf) : new Date()
+    if (Number.isNaN(cutoff.getTime())) throw new Error('تاريخ تقرير أعمار الديون غير صحيح')
+    cutoff.setUTCHours(23, 59, 59, 999)
     const invoices = await prisma.purchaseInvoice.findMany({
-      where: { status: 'confirmed' }, include: { supplier: true }, orderBy: { invoiceDate: 'asc' },
+      where: { status: 'confirmed' },
+      include: { supplier: true, payments: true, returns: true },
+      orderBy: { invoiceDate: 'asc' },
     })
     const map = new Map<number, any>()
-    for (const inv of invoices) {
-      const sid = inv.supplierId ?? 0
-      if (!map.has(sid)) map.set(sid, { supplier: inv.supplier, rows: [], total: 0, c0: 0, c30: 0, c60: 0, c90: 0 })
-      const entry = map.get(sid)!
-      const days = Math.floor((cutoff.getTime() - new Date(inv.invoiceDate).getTime()) / 86400000)
-      entry.rows.push({ ...inv, days })
-      entry.total += inv.total
-      if      (days <= 30) entry.c0  += inv.total
-      else if (days <= 60) entry.c30 += inv.total
-      else if (days <= 90) entry.c60 += inv.total
-      else                 entry.c90 += inv.total
+    for (const invoice of invoices) {
+      const supplierId = invoice.supplierId ?? 0
+      if (!map.has(supplierId)) {
+        map.set(supplierId, {
+          supplier: invoice.supplier, rows: [], total: 0, c0: 0, c30: 0, c60: 0, c90: 0,
+        })
+      }
+      const entry = map.get(supplierId)!
+      const paid = invoice.payments.reduce((sum, payment) => sum + payment.amount, 0)
+      const returned = invoice.returns.reduce((sum, ret) => {
+        const taxShare = invoice.subtotal > 0
+          ? Math.round(invoice.taxAmount * ret.total / invoice.subtotal * 100) / 100
+          : 0
+        return sum + ret.total + taxShare
+      }, 0)
+      const due = Math.max(0, invoice.total - paid - returned)
+      if (due <= 0.005) continue
+      const days = Math.max(0, Math.floor((cutoff.getTime() - new Date(invoice.invoiceDate).getTime()) / 86400000))
+      const row = { ...invoice, paid, returned, due, days }
+      entry.rows.push(row)
+      entry.total += due
+      if (days <= 30) entry.c0 += due
+      else if (days <= 60) entry.c30 += due
+      else if (days <= 90) entry.c60 += due
+      else entry.c90 += due
     }
-    return Array.from(map.values()).sort((a, b) => b.total - a.total)
+    return Array.from(map.values()).filter(entry => entry.total > 0.005).sort((a, b) => b.total - a.total)
   })
 
   ipcHandle('reports:executiveSummary', async (_, { from, to }: any = {}) => {
