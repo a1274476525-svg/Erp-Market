@@ -105,10 +105,19 @@ async function ensureSystemRole() {
       data: { name: 'مدير النظام', fullAccess: true, permissions: '[]', isSystem: true },
     })
   }
+
+  // Never promote users with missing/renamed roles to system administrator.
+  // Keep their accounts usable for login, but give them no permissions until
+  // an administrator explicitly assigns a valid role.
+  const fallbackRole = await prisma.role.upsert({
+    where: { name: 'مستخدم بلا صلاحيات' },
+    update: { fullAccess: false, permissions: '[]', isSystem: false },
+    create: { name: 'مستخدم بلا صلاحيات', fullAccess: false, permissions: '[]', isSystem: false },
+  })
   const knownNames = (await prisma.role.findMany({ select: { name: true } })).map(r => r.name)
   await prisma.user.updateMany({
     where: { role: { notIn: knownNames } },
-    data:  { role: sysRole.name },
+    data:  { role: fallbackRole.name },
   })
 }
 
@@ -336,13 +345,13 @@ function setupIpcHandlers() {
       if (!role) throw new Error('دور المستخدم غير موجود')
 
       const action = channel.split(':')[1] ?? ''
-      if (mutatingActions.has(action) && !role.fullAccess) {
+      if (mutatingActions.has(action) && !role.fullAccess && channel !== 'activity:log') {
         const allowedPaths = permissionPaths(channel)
-        if (allowedPaths.length > 0 && !allowedPaths.some(path =>
+        const hasPermission = allowedPaths.length > 0 && allowedPaths.some(path =>
           role.permissions.some(permission => path === permission || path.startsWith(permission + '/'))
-        )) {
-          throw new Error('ليس لديك صلاحية لتنفيذ هذه العملية')
-        }
+        )
+        // Fail closed: an unmapped mutation must never become implicitly allowed.
+        if (!hasPermission) throw new Error('ليس لديك صلاحية لتنفيذ هذه العملية')
       }
       return handler(event, ...args)
     })
@@ -1696,6 +1705,9 @@ function setupIpcHandlers() {
   })
 
   ipcHandle('expenses:create', async (_, data) => {
+    const amount = Number(data?.amount)
+    if (!Number.isFinite(amount) || amount <= 0) throw new Error('يجب إدخال مبلغ مصروف أكبر من صفر')
+    if (!Number.isInteger(data?.categoryId) || data.categoryId <= 0) throw new Error('اختر نوع المصروف')
     const expense = await prisma.expense.create({ data, include: { category: true } })
 
     try {
@@ -1703,20 +1715,44 @@ function setupIpcHandlers() {
         { id: expense.id, amount: expense.amount, description: expense.description, date: data.date || new Date(), categoryName: expense.category?.name },
         data.paymentMethod,
       )
-    } catch (e) {
-      console.error('[AutoJE:expense]', e)
+    } catch (error) {
+      // Never leave an expense saved without its corresponding ledger posting.
+      // The automatic journal entry is created atomically with its lines, so a
+      // failed posting can be safely compensated by removing this new document.
+      await prisma.expense.delete({ where: { id: expense.id } })
+      console.error('[AutoJE:expense]', error)
+      throw new Error('لم يتم حفظ المصروف لأن ترحيله المحاسبي فشل: ' + (error instanceof Error ? error.message : String(error)))
     }
 
     return expense
   })
 
-  ipcHandle('expenses:update', (_, { id, ...data }) =>
-    prisma.expense.update({ where: { id }, data, include: { category: true } })
-  )
+  ipcHandle('expenses:update', async (_, { id, ...data }) => {
+    const existing = await prisma.expense.findUnique({ where: { id } })
+    if (!existing) throw new Error('المصروف غير موجود')
+    const postedEntries = await prisma.journalEntry.count({
+      where: { source: 'expense', sourceId: id, status: 'posted' },
+    })
+    if (postedEntries > 0) {
+      throw new Error('لا يمكن تعديل مصروف مرحّل قبل تنفيذ عكس محاسبي موثّق. لم يتم تغيير المصروف.')
+    }
+    if (data.amount !== undefined && (!Number.isFinite(Number(data.amount)) || Number(data.amount) <= 0)) {
+      throw new Error('يجب إدخال مبلغ مصروف أكبر من صفر')
+    }
+    return prisma.expense.update({ where: { id }, data, include: { category: true } })
+  })
 
-  ipcHandle('expenses:delete', (_, id: number) =>
-    prisma.expense.delete({ where: { id } })
-  )
+  ipcHandle('expenses:delete', async (_, id: number) => {
+    const existing = await prisma.expense.findUnique({ where: { id } })
+    if (!existing) throw new Error('المصروف غير موجود')
+    const postedEntries = await prisma.journalEntry.count({
+      where: { source: 'expense', sourceId: id, status: 'posted' },
+    })
+    if (postedEntries > 0) {
+      throw new Error('لا يمكن حذف مصروف مرحّل قبل تنفيذ عكس محاسبي موثّق. لم يتم حذف المصروف.')
+    }
+    return prisma.expense.delete({ where: { id } })
+  })
 
   // ─── CHART OF ACCOUNTS ────────────────────────────────────────
   ipcHandle('accounts:getAll', () =>
@@ -1801,10 +1837,24 @@ function setupIpcHandlers() {
     lines: { accountId: number; debit: number; credit: number; description?: string }[]
   }) {
     const { date, description, reference, source, sourceId, lines } = opts
-    if (lines.length < 2) return null
+    if (lines.length < 2) throw new Error('القيد الآلي يجب أن يحتوي على سطرين على الأقل')
+    for (const line of lines) {
+      if (!Number.isFinite(line.debit) || !Number.isFinite(line.credit) || line.debit < 0 || line.credit < 0 || (line.debit > 0 && line.credit > 0)) {
+        throw new Error('قيمة مدين/دائن غير صالحة في القيد الآلي')
+      }
+    }
     const totalD = lines.reduce((s, l) => s + l.debit, 0)
     const totalC = lines.reduce((s, l) => s + l.credit, 0)
-    if (Math.abs(totalD - totalC) > 0.01) return null
+    if (Math.abs(totalD - totalC) > 0.01) {
+      throw new Error(`القيد الآلي غير متوازن: مدين ${totalD.toFixed(2)} ≠ دائن ${totalC.toFixed(2)}`)
+    }
+    // A source document may legitimately create multiple entries (e.g. sales
+    // revenue and COGS); the description distinguishes each posting. Return an
+    // existing matching entry on retries instead of duplicating it.
+    const existing = await prisma.journalEntry.findFirst({
+      where: { source, sourceId, description, status: 'posted' },
+    })
+    if (existing) return existing
     const number = await nextJENumber()
     return prisma.journalEntry.create({
       data: {
@@ -1867,7 +1917,7 @@ function setupIpcHandlers() {
     })
   }
 
-  async function postSaleJE(order: { id: number; orderNumber: string; createdAt: Date; total: number; subtotal: number; taxAmount: number; paymentMethod: string; items: { productId: number; quantity: number }[] }) {
+  async function postSaleJE(order: { id: number; orderNumber: string; createdAt: Date; total: number; subtotal: number; discountAmount: number; taxAmount: number; paymentMethod: string; items: { productId: number; quantity: number }[] }) {
     await ensureStandardAccounts()
     const [cashAcc, bankAcc, salesAcc, vatAcc, cogsAcc, invAcc] = await Promise.all([
       findAccByCode('1111'), findAccByCode('1112'),
@@ -1876,10 +1926,15 @@ function setupIpcHandlers() {
     ])
     const drAcc = order.paymentMethod === 'cash' ? cashAcc : bankAcc
     if (!drAcc || !salesAcc) throw new Error('تعذر إيجاد حسابات النقدية/المبيعات في دليل الحسابات')
+    const discountAmount = Number(order.discountAmount ?? 0)
+    if (!Number.isFinite(discountAmount) || discountAmount < 0 || discountAmount > order.subtotal) {
+      throw new Error('قيمة خصم فاتورة البيع غير صالحة')
+    }
+    const netSales = order.subtotal - discountAmount
 
     const salesLines: { accountId: number; debit: number; credit: number; description?: string }[] = [
       { accountId: drAcc.id,    debit: order.total,    credit: 0,              description: order.orderNumber },
-      { accountId: salesAcc.id, debit: 0,              credit: order.subtotal, description: order.orderNumber },
+      { accountId: salesAcc.id, debit: 0,              credit: netSales, description: order.orderNumber },
     ]
     if (order.taxAmount > 0 && vatAcc) {
       salesLines.push({ accountId: vatAcc.id, debit: 0, credit: order.taxAmount, description: 'ض.ق.م مبيعات' })
@@ -2466,7 +2521,7 @@ function setupIpcHandlers() {
   ipcHandle('reports:financial', async (_, { from, to }: { from?: string; to?: string } = {}) => {
     const dateFilter: any = {}
     if (from) { const d = new Date(from); d.setUTCHours(0, 0, 0, 0); dateFilter.gte = d }
-    if (to)   { const d = new Date(to);   d.setUTCDate(d.getUTCDate() + 1); d.setUTCHours(0, 0, 0, 0); dateFilter.lte = d }
+    if (to)   { const d = new Date(to);   d.setUTCDate(d.getUTCDate() + 1); d.setUTCHours(0, 0, 0, 0); dateFilter.lt = d }
 
     const salesWhere: any  = { status: 'completed', ...(Object.keys(dateFilter).length ? { createdAt: dateFilter } : {}) }
     const purWhere: any    = Object.keys(dateFilter).length ? { invoiceDate: dateFilter } : {}
@@ -2480,47 +2535,12 @@ function setupIpcHandlers() {
       prisma.product.findMany({ where: { isActive: true } }),
     ])
 
-    // Revenue
-    const totalRevenue  = orders.reduce((s, o) => s + o.subtotal, 0)
-    const totalVatOut   = orders.reduce((s, o) => s + o.taxAmount, 0)
-    const totalReturns  = 0 // simplified
-
-    // Purchases
-    const totalPurchases   = invoices.reduce((s, i) => s + i.subtotal, 0)
-    const totalVatIn       = invoices.reduce((s, i) => s + i.taxAmount, 0)
-
-    // COGS: sum of (item.quantity * costPrice) for sold items
-    let cogs = 0
-    for (const order of orders) {
-      for (const item of order.items) {
-        cogs += item.quantity * (item.product?.costPrice ?? item.unitPrice)
-      }
-    }
-
-    // Gross Profit
-    const grossProfit = totalRevenue - cogs
-
-    // Expenses by category
-    const expByCategory: Record<string, number> = {}
-    let totalExpenses = 0
-    for (const exp of expenses) {
-      const cat = exp.category?.name ?? 'غير مصنف'
-      expByCategory[cat] = (expByCategory[cat] ?? 0) + exp.amount
-      totalExpenses += exp.amount
-    }
-
-    // Net Profit
-    const netProfit = grossProfit - totalExpenses
-
-    // Inventory value
-    const inventoryValue = products.reduce((s, p) => s + p.currentStock * p.costPrice, 0)
-
-    // Bank totals
-    const totalCash  = bankAccounts.filter(b => b.type === 'cash' || b.type === 'custody').reduce((s, b) => s + b.currentBalance, 0)
-    const totalBank  = bankAccounts.filter(b => b.type === 'bank').reduce((s, b) => s + b.currentBalance, 0)
-
-    // VAT
-    const vatNetPayable = totalVatOut - totalVatIn
+    // VAT detail is sourced from confirmed source documents; financial totals below
+    // are sourced from posted double-entry journals so returns and manual entries
+    // are included and historical COGS does not depend on today's product cost.
+    const totalVatOut = orders.reduce((s, o) => s + o.taxAmount, 0)
+    const totalPurchases = invoices.reduce((s, i) => s + i.subtotal, 0)
+    const totalVatIn = invoices.reduce((s, i) => s + i.taxAmount, 0)
 
     // Trial balance from actual posted journal entries
     const jeWhere: any = { status: 'posted' }
@@ -2538,6 +2558,37 @@ function setupIpcHandlers() {
     }
     const trialBalance = Array.from(tbMap.values())
       .sort((a, b) => a.account.code.localeCompare(b.account.code, undefined, { numeric: true }))
+
+    // Use posted ledger balances as the source of truth for financial statements.
+    // Account code 5 = cost of sales; code 6 = operating expenses.
+    let totalRevenue = 0
+    let cogs = 0
+    let totalExpenses = 0
+    const expByCategory: Record<string, number> = {}
+    let inventoryValue = 0
+    let totalCash = 0
+    let totalBank = 0
+    for (const row of trialBalance) {
+      const account = row.account
+      const netDebit = row.debit - row.credit
+      const netCredit = row.credit - row.debit
+      if (account.type === 'revenue') totalRevenue += netCredit
+      if (account.type === 'expense' && String(account.code).startsWith('52')) cogs += netDebit
+      if (account.type === 'expense' && String(account.code).startsWith('6')) {
+        const amount = netDebit
+        totalExpenses += amount
+        const category = account.name || 'مصروفات تشغيلية'
+        expByCategory[category] = (expByCategory[category] ?? 0) + amount
+      }
+      if (account.type === 'asset' && String(account.code).startsWith('113')) {
+        inventoryValue += account.normalBalance === 'credit' ? -netCredit : netDebit
+      }
+      if (account.code === '1111') totalCash += account.normalBalance === 'credit' ? -netCredit : netDebit
+      if (account.code === '1112') totalBank += account.normalBalance === 'credit' ? -netCredit : netDebit
+    }
+    const grossProfit = totalRevenue - cogs
+    const netProfit = grossProfit - totalExpenses
+    const vatNetPayable = totalVatOut - totalVatIn
 
     return {
       period: { from, to },
@@ -2612,24 +2663,65 @@ function setupIpcHandlers() {
   })
 
   ipcHandle('reports:cashFlow', async (_, { from, to }: any = {}) => {
-    const df: any = {}
-    if (from) { const d = new Date(from); d.setUTCHours(0,0,0,0); df.gte = d }
-    if (to)   { const d = new Date(to); d.setUTCDate(d.getUTCDate()+1); d.setUTCHours(0,0,0,0); df.lte = d }
-    const txs = await prisma.bankTransaction.findMany({
-      where: df.gte ? { date: df } : {},
-      include: { bankAccount: true },
-      orderBy: { date: 'asc' },
-    })
+    const dateFilter: any = {}
+    if (from) { const d = new Date(from); d.setUTCHours(0, 0, 0, 0); dateFilter.gte = d }
+    if (to)   { const d = new Date(to); d.setUTCDate(d.getUTCDate() + 1); d.setUTCHours(0, 0, 0, 0); dateFilter.lt = d }
+
+    // Build cash movement from posted journal entries, not only manually
+    // recorded bank transactions. BankTransaction remains supplementary detail.
+    const [bankAccounts, cashAccounts, entries, txs] = await Promise.all([
+      prisma.bankAccount.findMany({ where: { isActive: true }, include: { account: true } }),
+      prisma.account.findMany({ where: { isActive: true, code: { in: ['1111', '1112'] } } }),
+      prisma.journalEntry.findMany({
+        where: { status: 'posted', ...(Object.keys(dateFilter).length ? { date: dateFilter } : {}) },
+        include: { lines: { include: { account: true } } },
+        orderBy: { date: 'asc' },
+      }),
+      prisma.bankTransaction.findMany({
+        where: Object.keys(dateFilter).length ? { date: dateFilter } : {},
+        include: { bankAccount: true },
+        orderBy: { date: 'asc' },
+      }),
+    ])
+
+    const cashIds = new Set<number>()
+    for (const b of bankAccounts) if (b.accountId) cashIds.add(b.accountId)
+    for (const a of cashAccounts) cashIds.add(a.id)
+
     const byMonth: Record<string, { deposits: number; withdrawals: number }> = {}
-    for (const t of txs) {
-      const key = new Date(t.date).toISOString().slice(0, 7)
+    const transactions: any[] = []
+    let totalIn = 0
+    let totalOut = 0
+    for (const entry of entries) {
+      const cashLines = entry.lines.filter(line => cashIds.has(line.accountId))
+      const netCash = cashLines.reduce((sum, line) => sum + line.debit - line.credit, 0)
+      if (Math.abs(netCash) < 0.005) continue
+      const amount = Math.abs(netCash)
+      const key = new Date(entry.date).toISOString().slice(0, 7)
       if (!byMonth[key]) byMonth[key] = { deposits: 0, withdrawals: 0 }
-      if (t.type === 'deposit')    byMonth[key].deposits    += t.amount
-      if (t.type === 'withdrawal') byMonth[key].withdrawals += t.amount
+      if (netCash > 0) {
+        byMonth[key].deposits += amount
+        totalIn += amount
+      } else {
+        byMonth[key].withdrawals += amount
+        totalOut += amount
+      }
+      transactions.push({
+        id: entry.id,
+        date: entry.date,
+        description: entry.description || entry.reference || entry.number,
+        type: netCash > 0 ? 'deposit' : 'withdrawal',
+        amount,
+        journalEntryNumber: entry.number,
+      })
     }
-    const totalIn  = txs.filter(t => t.type === 'deposit').reduce((s, t) => s + t.amount, 0)
-    const totalOut = txs.filter(t => t.type === 'withdrawal').reduce((s, t) => s + t.amount, 0)
-    return { transactions: txs, byMonth, totals: { in: totalIn, out: totalOut, net: totalIn - totalOut } }
+    return {
+      transactions,
+      bankTransactions: txs,
+      byMonth,
+      totals: { in: totalIn, out: totalOut, net: totalIn - totalOut },
+      basis: 'posted_journal_entries',
+    }
   })
 
   ipcHandle('reports:arAging', async (_, { asOf }: any = {}) => {
@@ -2768,8 +2860,12 @@ function setupIpcHandlers() {
   })
 
   // ─── SYSTEM ─────────────────────────────────────────────────────
-  ipcHandle('system:clearAllData', async (_, payload: { sections: string[]; userId: number; pin: string }) => {
+  ipcHandle('system:clearAllData', async (event, payload: { sections: string[]; userId: number; pin: string }) => {
     const { sections, userId, pin } = payload || {}
+    const sessionUserId = authenticatedSessions.get(event.sender.id)
+    if (!sessionUserId || sessionUserId !== userId) {
+      throw new Error('انتهت جلسة الدخول أو أن المستخدم لا يطابق الجلسة الحالية. سجل الدخول مرة أخرى')
+    }
     if (!Array.isArray(sections) || sections.length === 0) {
       throw new Error('اختر قسمًا واحدًا على الأقل')
     }
