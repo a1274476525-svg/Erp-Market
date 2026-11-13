@@ -55,6 +55,7 @@ contextBridge.exposeInMainWorld('api', {
     updateDraft:  (data: any)  => ipcRenderer.invoke('invoices:updateDraft', data),
     deleteDraft:  (id: number) => ipcRenderer.invoke('invoices:deleteDraft', id),
     confirmDraft: (id: number) => ipcRenderer.invoke('invoices:confirmDraft', id),
+    createReturn: (data: any) => ipcRenderer.invoke('invoices:createReturn', data),
   },
   purchaseRequests: {
     getAll:       ()           => ipcRenderer.invoke('purchaseRequests:getAll'),
