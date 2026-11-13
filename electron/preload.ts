@@ -171,6 +171,7 @@ contextBridge.exposeInMainWorld('api', {
   },
   expenseCategories: {
     getAll:  ()           => ipcRenderer.invoke('expenseCategories:getAll'),
+    getAccounts: () => ipcRenderer.invoke('expenseCategories:getAccounts'),
     create:  (data: any)  => ipcRenderer.invoke('expenseCategories:create', data),
     update:  (data: any)  => ipcRenderer.invoke('expenseCategories:update', data),
     delete:  (id: number) => ipcRenderer.invoke('expenseCategories:delete', id),
