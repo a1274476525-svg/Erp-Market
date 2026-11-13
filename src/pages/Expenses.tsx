@@ -5,7 +5,7 @@ import { format } from 'date-fns'
 import { ar } from 'date-fns/locale'
 import { useSettings } from '../contexts/SettingsContext'
 
-interface ExpenseCategory { id: number; name: string; description?: string }
+interface ExpenseCategory { id: number; name: string; description?: string; accountId?: number | null; account?: { id: number; code: string; name: string } | null }
 interface Expense {
   id: number
   categoryId: number
@@ -23,19 +23,21 @@ const PAYMENT_METHODS = [
   { value: 'vodafone', label: 'فودافون كاش' },
 ]
 
-function CategoryModal({ cat, onSave, onClose }: {
+function CategoryModal({ cat, accounts, onSave, onClose }: {
   cat: ExpenseCategory | null
-  onSave: (data: { name: string; description: string }) => void
+  accounts: { id: number; code: string; name: string }[]
+  onSave: (data: { name: string; description: string; accountId: number | null }) => void
   onClose: () => void
 }) {
   const [name, setName]         = useState(cat?.name ?? '')
   const [desc, setDesc]         = useState(cat?.description ?? '')
+  const [accountId, setAccountId] = useState<number | ''>(cat?.accountId ?? '')
   const [saving, setSaving]     = useState(false)
 
   async function handleSubmit() {
     if (!name.trim()) return
     setSaving(true)
-    await onSave({ name: name.trim(), description: desc.trim() })
+    await onSave({ name: name.trim(), description: desc.trim(), accountId: accountId === '' ? null : accountId })
     setSaving(false)
   }
 
@@ -58,6 +60,15 @@ function CategoryModal({ cat, onSave, onClose }: {
             <input value={desc} onChange={e => setDesc(e.target.value)}
               className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
               placeholder="وصف مختصر..." />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1">حساب المصروف في دليل الحسابات</label>
+            <select value={accountId} onChange={e => setAccountId(e.target.value ? Number(e.target.value) : '')}
+              className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500">
+              <option value="">الحساب الافتراضي (مصروفات عامة 61)</option>
+              {accounts.map(account => <option key={account.id} value={account.id}>{account.code} — {account.name}</option>)}
+            </select>
+            <p className="text-xs text-slate-400 mt-1">سيتم ترحيل المصروفات الجديدة لهذا الحساب بدل الحساب العام.</p>
           </div>
         </div>
         <div className="flex gap-2 mt-5">
@@ -159,6 +170,7 @@ export default function Expenses() {
   const { settings } = useSettings()
   const [tab, setTab]                   = useState<'expenses' | 'categories'>('expenses')
   const [categories, setCategories]     = useState<ExpenseCategory[]>([])
+  const [expenseAccounts, setExpenseAccounts] = useState<{ id: number; code: string; name: string }[]>([])
   const [expenses, setExpenses]         = useState<Expense[]>([])
   const [catModal, setCatModal]         = useState<ExpenseCategory | null | false>(false)
   const [expModal, setExpModal]         = useState<Expense | null | false>(false)
@@ -171,6 +183,10 @@ export default function Expenses() {
     setCategories(await window.api.expenseCategories.getAll())
   }
 
+  async function loadExpenseAccounts() {
+    setExpenseAccounts(await window.api.expenseCategories.getAccounts())
+  }
+
   async function loadExpenses() {
     const params: any = {}
     if (filterFrom) params.from = filterFrom
@@ -179,7 +195,7 @@ export default function Expenses() {
     setExpenses(await window.api.expenses.getAll(params))
   }
 
-  useEffect(() => { loadCategories() }, [])
+  useEffect(() => { loadCategories(); loadExpenseAccounts() }, [])
   useEffect(() => { loadExpenses() }, [filterFrom, filterTo, filterCat])
 
   async function saveCategory(data: any) {
@@ -449,6 +465,7 @@ export default function Expenses() {
                   <div>
                     <p className="font-medium text-slate-800 text-sm">{cat.name}</p>
                     {cat.description && <p className="text-xs text-slate-400 mt-0.5">{cat.description}</p>}
+                    <p className="text-xs text-emerald-700 mt-0.5">{cat.account ? `${cat.account.code} — ${cat.account.name}` : 'الحساب الافتراضي: 61'}</p>
                   </div>
                   <div className="flex gap-1">
                     <button onClick={() => setCatModal(cat)}
@@ -470,6 +487,7 @@ export default function Expenses() {
       {catModal !== false && (
         <CategoryModal
           cat={catModal as ExpenseCategory | null}
+          accounts={expenseAccounts}
           onSave={saveCategory}
           onClose={() => setCatModal(false)}
         />

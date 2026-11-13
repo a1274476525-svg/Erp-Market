@@ -295,6 +295,7 @@ function setupIpcHandlers() {
     'voidOrder', 'createReturn', 'saveDraft', 'updateDraft', 'deleteDraft', 'confirmDraft',
     'updateStatus', 'execute', 'close', 'removeItem', 'updateItem', 'post', 'reverse',
     'backfillMissing', 'seedDefault', 'setDefault', 'syncStock', 'set', 'log', 'ignore',
+    'receivePayment', 'payInvoice',
     'unmatch', 'import', 'match', 'createFromLine', 'applyRules', 'selectImage', 'removeImage',
     'selectFolder', 'clearAllData', 'parseFile',
   ])
@@ -302,6 +303,9 @@ function setupIpcHandlers() {
     const [group, action] = channel.split(':')
     if (group === 'pos' && action === 'voidOrder') return ['/sales', '/pos']
     if (group === 'pos' && action === 'createReturn') return ['/returns', '/pos']
+    if (group === 'invoices' && action === 'createReturn') return ['/purchase-returns', '/invoices']
+    if (group === 'customers' && ['getPayments', 'receivePayment'].includes(action)) return ['/settlements', '/customers']
+    if (group === 'suppliers' && ['getPayments', 'payInvoice'].includes(action)) return ['/settlements', '/suppliers']
     if (group === 'stock' && action === 'waste') return ['/waste', '/stock']
     const paths: Record<string, string[]> = {
       products: ['/products'], productBarcodes: ['/products'], productUnits: ['/products'],
@@ -601,6 +605,67 @@ function setupIpcHandlers() {
     })
   )
 
+  ipcHandle('customers:getPayments', (_, customerId?: number) =>
+    prisma.customerPayment.findMany({
+      where: customerId ? { customerId } : undefined,
+      include: { customer: true, order: true },
+      orderBy: { date: 'desc' },
+    })
+  )
+
+  ipcHandle('customers:receivePayment', async (_, data: { orderId: number; amount: number; paymentMethod: string; date?: string | Date; reference?: string; notes?: string }) => {
+    const amount = Number(data.amount)
+    if (!Number.isFinite(amount) || amount <= 0) throw new Error('أدخل مبلغ تحصيل صحيحًا أكبر من صفر')
+    if (!['cash', 'card', 'instapay', 'vodafone'].includes(data.paymentMethod)) throw new Error('طريقة التحصيل غير مدعومة')
+    const paymentDate = data.date ? new Date(data.date) : new Date()
+    if (Number.isNaN(paymentDate.getTime())) throw new Error('تاريخ التحصيل غير صحيح')
+
+    return prisma.$transaction(async (tx) => {
+      const order = await tx.posOrder.findUnique({ where: { id: data.orderId }, include: { returns: true } })
+      if (!order || order.status !== 'completed' || !order.customerId) throw new Error('الفاتورة الآجلة أو العميل غير موجود')
+      if (order.paymentMethod !== 'credit') throw new Error('هذه الفاتورة ليست مسجلة على الحساب')
+      const paid = await tx.customerPayment.aggregate({ where: { orderId: order.id }, _sum: { amount: true } })
+      const returned = order.returns.reduce((sum, ret) => {
+        const ratio = order.subtotal > 0 ? ret.total / order.subtotal : 0
+        return sum + ret.total - Number(order.discountAmount ?? 0) * ratio + Number(order.taxAmount ?? 0) * ratio
+      }, 0)
+      const outstanding = Math.max(0, order.total - (paid._sum.amount ?? 0) - returned)
+      if (amount > outstanding + 0.005) throw new Error(`مبلغ التحصيل أكبر من المتبقي: ${outstanding.toFixed(2)}`)
+
+      await ensureStandardAccounts(tx)
+      const cashAcc = await findAccByCode('1111', tx)
+      const bankAcc = await findAccByCode('1112', tx)
+      const receivableAcc = await findAccByCode('1121', tx)
+      const debitAcc = data.paymentMethod === 'cash' ? cashAcc : bankAcc
+      if (!debitAcc || !receivableAcc) throw new Error('حساب النقدية/البنك أو العملاء غير موجود في دليل الحسابات')
+
+      const payment = await tx.customerPayment.create({
+        data: {
+          customerId: order.customerId,
+          orderId: order.id,
+          amount,
+          paymentMethod: data.paymentMethod,
+          date: paymentDate,
+          reference: data.reference?.trim() || null,
+          notes: data.notes?.trim() || null,
+        },
+      })
+      await autoJE({
+        date: paymentDate,
+        description: `تحصيل من عميل - ${order.orderNumber} - RCPT-${payment.id}`,
+        reference: data.reference || `RCPT-${payment.id}`,
+        source: 'customer_payment',
+        sourceId: payment.id,
+        lines: [
+          { accountId: debitAcc.id, debit: amount, credit: 0, description: 'تحصيل نقدي/بنكي' },
+          { accountId: receivableAcc.id, debit: 0, credit: amount, description: 'تخفيض مديونية العميل' },
+        ],
+        db: tx,
+      })
+      return { ...payment, outstandingAfter: Math.max(0, outstanding - amount) }
+    })
+  })
+
   // ─── SUPPLIERS ─────────────────────────────────────────────────
   ipcHandle('suppliers:getAll', () =>
     prisma.supplier.findMany({ orderBy: { name: 'asc' } })
@@ -618,11 +683,74 @@ function setupIpcHandlers() {
     prisma.supplier.delete({ where: { id } })
   )
 
+  ipcHandle('suppliers:getPayments', (_, supplierId?: number) =>
+    prisma.supplierPayment.findMany({
+      where: supplierId ? { supplierId } : undefined,
+      include: { supplier: true, invoice: true },
+      orderBy: { date: 'desc' },
+    })
+  )
+
+  ipcHandle('suppliers:payInvoice', async (_, data: { invoiceId: number; amount: number; paymentMethod: string; date?: string | Date; reference?: string; notes?: string }) => {
+    const amount = Number(data.amount)
+    if (!Number.isFinite(amount) || amount <= 0) throw new Error('أدخل مبلغ سداد صحيحًا أكبر من صفر')
+    if (!['cash', 'card', 'instapay', 'vodafone'].includes(data.paymentMethod)) throw new Error('طريقة السداد غير مدعومة')
+    const paymentDate = data.date ? new Date(data.date) : new Date()
+    if (Number.isNaN(paymentDate.getTime())) throw new Error('تاريخ السداد غير صحيح')
+
+    return prisma.$transaction(async (tx) => {
+      const invoice = await tx.purchaseInvoice.findUnique({ where: { id: data.invoiceId } })
+      if (!invoice || invoice.status !== 'confirmed' || !invoice.supplierId) throw new Error('فاتورة المورد غير موجودة أو غير مرتبطة بمورد')
+      const paid = await tx.supplierPayment.aggregate({ where: { invoiceId: invoice.id }, _sum: { amount: true } })
+      const returns = await tx.purchaseReturn.findMany({ where: { invoiceId: invoice.id }, select: { total: true } })
+      const returned = returns.reduce((sum, ret) => {
+        const taxShare = invoice.subtotal > 0
+          ? Math.round(invoice.taxAmount * ret.total / invoice.subtotal * 100) / 100
+          : 0
+        return sum + ret.total + taxShare
+      }, 0)
+      const outstanding = Math.max(0, invoice.total - (paid._sum.amount ?? 0) - returned)
+      if (amount > outstanding + 0.005) throw new Error(`مبلغ السداد أكبر من المتبقي: ${outstanding.toFixed(2)}`)
+
+      await ensureStandardAccounts(tx)
+      const payableAcc = await findAccByCode('2111', tx)
+      const cashAcc = await findAccByCode('1111', tx)
+      const bankAcc = await findAccByCode('1112', tx)
+      const creditAcc = data.paymentMethod === 'cash' ? cashAcc : bankAcc
+      if (!payableAcc || !creditAcc) throw new Error('حساب الموردين أو النقدية/البنك غير موجود في دليل الحسابات')
+
+      const payment = await tx.supplierPayment.create({
+        data: {
+          supplierId: invoice.supplierId,
+          invoiceId: invoice.id,
+          amount,
+          paymentMethod: data.paymentMethod,
+          date: paymentDate,
+          reference: data.reference?.trim() || null,
+          notes: data.notes?.trim() || null,
+        },
+      })
+      await autoJE({
+        date: paymentDate,
+        description: `سداد مورد - ${invoice.invoiceNumber ?? `INV-${invoice.id}`} - PAY-${payment.id}`,
+        reference: data.reference || `PAY-${payment.id}`,
+        source: 'supplier_payment',
+        sourceId: payment.id,
+        lines: [
+          { accountId: payableAcc.id, debit: amount, credit: 0, description: 'تخفيض مديونية المورد' },
+          { accountId: creditAcc.id, debit: 0, credit: amount, description: 'سداد نقدي/بنكي' },
+        ],
+        db: tx,
+      })
+      return { ...payment, outstandingAfter: Math.max(0, outstanding - amount) }
+    })
+  })
+
   // ─── PURCHASE INVOICES ─────────────────────────────────────────
   ipcHandle('invoices:getAll', () =>
     prisma.purchaseInvoice.findMany({
       where: { status: 'confirmed' },
-      include: { supplier: true, items: { include: { product: true } } },
+      include: { supplier: true, items: { include: { product: true } }, payments: true, returns: { include: { items: true } } },
       orderBy: { invoiceDate: 'desc' },
     })
   )
@@ -647,8 +775,15 @@ function setupIpcHandlers() {
         if (!Number.isFinite(item.quantity) || item.quantity <= 0 || !Number.isFinite(item.unitPrice) || item.unitPrice < 0) {
           throw new Error('بيانات صنف في فاتورة الشراء غير صالحة')
         }
+        const productCost = await tx.product.findUnique({ where: { id: item.productId }, select: { costPrice: true } })
+        if (!productCost) throw new Error('المنتج غير موجود')
+        const stockBefore = await tx.warehouseStock.aggregate({ where: { productId: item.productId }, _sum: { quantity: true } })
+        const quantityBefore = stockBefore._sum.quantity ?? 0
+        const weightedAverageCost = quantityBefore + item.quantity > 0
+          ? ((quantityBefore * productCost.costPrice) + (item.quantity * item.unitPrice)) / (quantityBefore + item.quantity)
+          : item.unitPrice
         await changeWarehouseStock(tx, warehouse.id, item.productId, item.quantity)
-        await tx.product.update({ where: { id: item.productId }, data: { costPrice: item.unitPrice } })
+        await tx.product.update({ where: { id: item.productId }, data: { costPrice: weightedAverageCost } })
         await tx.stockMovement.create({
           data: { productId: item.productId, quantity: item.quantity, type: 'purchase', referenceId: inv.id },
         })
@@ -695,8 +830,15 @@ function setupIpcHandlers() {
       const warehouse = await getDefaultWarehouse(tx)
       for (const item of inv.items) {
         if (!Number.isFinite(item.quantity) || item.quantity <= 0 || !Number.isFinite(item.unitPrice) || item.unitPrice < 0) throw new Error('بيانات صنف شراء غير صالحة')
+        const productCost = await tx.product.findUnique({ where: { id: item.productId }, select: { costPrice: true } })
+        if (!productCost) throw new Error('المنتج غير موجود')
+        const stockBefore = await tx.warehouseStock.aggregate({ where: { productId: item.productId }, _sum: { quantity: true } })
+        const quantityBefore = stockBefore._sum.quantity ?? 0
+        const weightedAverageCost = quantityBefore + item.quantity > 0
+          ? ((quantityBefore * productCost.costPrice) + (item.quantity * item.unitPrice)) / (quantityBefore + item.quantity)
+          : item.unitPrice
         await changeWarehouseStock(tx, warehouse.id, item.productId, item.quantity)
-        await tx.product.update({ where: { id: item.productId }, data: { costPrice: item.unitPrice } })
+        await tx.product.update({ where: { id: item.productId }, data: { costPrice: weightedAverageCost } })
         await tx.stockMovement.create({
           data: { productId: item.productId, quantity: item.quantity, type: 'purchase', referenceId: id },
         })
@@ -706,6 +848,108 @@ function setupIpcHandlers() {
     })
 
     return invoice
+  })
+
+  ipcHandle('invoices:createReturn', async (_, data: { invoiceId: number; items: { productId: number; quantity: number }[]; reason?: string }) => {
+    if (!Number.isInteger(data.invoiceId) || !Array.isArray(data.items) || data.items.length === 0) {
+      throw new Error('اختر فاتورة وحدد صنفًا واحدًا على الأقل للمرتجع')
+    }
+    return prisma.$transaction(async (tx) => {
+      const invoice = await tx.purchaseInvoice.findUnique({
+        where: { id: data.invoiceId },
+        include: { items: true, returns: { include: { items: true } } },
+      })
+      if (!invoice || invoice.status !== 'confirmed' || !invoice.supplierId) throw new Error('فاتورة الشراء غير موجودة أو غير مؤكدة أو غير مرتبطة بمورد')
+      if (!Number.isFinite(invoice.subtotal) || invoice.subtotal <= 0) throw new Error('لا يمكن حساب ضريبة مرتجع لفاتورة مجموعها صفر')
+
+      const requested = new Map<number, number>()
+      for (const item of data.items) {
+        if (!Number.isInteger(item.productId) || !Number.isFinite(item.quantity) || item.quantity <= 0) {
+          throw new Error('كمية صنف المرتجع غير صالحة')
+        }
+        requested.set(item.productId, (requested.get(item.productId) ?? 0) + item.quantity)
+      }
+
+      const normalizedItems = [...requested.entries()].map(([productId, quantity]) => {
+        const purchased = invoice.items.filter(item => item.productId === productId)
+        if (purchased.length === 0) throw new Error('الصنف غير موجود في فاتورة الشراء')
+        const purchasedQty = purchased.reduce((sum, item) => sum + item.quantity, 0)
+        const returnedQty = invoice.returns.reduce((sum, ret) =>
+          sum + ret.items.filter(item => item.productId === productId).reduce((part, item) => part + item.quantity, 0), 0)
+        if (quantity > purchasedQty - returnedQty + 0.000001) {
+          throw new Error(`كمية المرتجع تتجاوز الكمية المشتراة للصنف ${purchased[0].productId}`)
+        }
+        const unitPrice = purchased.reduce((sum, item) => sum + item.unitPrice * item.quantity, 0) / purchasedQty
+        return { productId, productName: `صنف #${productId}`, quantity, unitPrice, total: quantity * unitPrice }
+      })
+
+      const warehouse = await getDefaultWarehouse(tx)
+      const itemsWithCost: { productId: number; productName: string; quantity: number; unitPrice: number; unitCost: number; total: number }[] = []
+      for (const item of normalizedItems) {
+        const product = await tx.product.findUnique({ where: { id: item.productId }, select: { name: true, costPrice: true } })
+        if (!product) throw new Error('المنتج غير موجود')
+        const stock = await tx.warehouseStock.findUnique({
+          where: { warehouseId_productId: { warehouseId: warehouse.id, productId: item.productId } },
+        })
+        if (!stock || stock.quantity < item.quantity) {
+          throw new Error(`المخزون غير كافٍ لإرجاع الصنف ${product.name} إلى المورد`)
+        }
+        itemsWithCost.push({ ...item, productName: product.name, unitCost: product.costPrice })
+      }
+
+      const subtotal = itemsWithCost.reduce((sum, item) => sum + item.total, 0)
+      const ratio = subtotal / invoice.subtotal
+      const taxShare = Math.round(invoice.taxAmount * ratio * 100) / 100
+      const supplierCredit = Math.round((subtotal + taxShare) * 100) / 100
+      const inventoryCost = Math.round(itemsWithCost.reduce((sum, item) => sum + item.quantity * item.unitCost, 0) * 100) / 100
+      const variance = Math.round((subtotal - inventoryCost) * 100) / 100
+      if (!Number.isFinite(supplierCredit) || supplierCredit <= 0 || !Number.isFinite(inventoryCost) || inventoryCost < 0) {
+        throw new Error('تعذر حساب قيمة مرتجع المورد')
+      }
+
+      const ret = await tx.purchaseReturn.create({
+        data: {
+          invoiceId: invoice.id,
+          reason: data.reason?.trim() || null,
+          total: subtotal,
+          items: { create: itemsWithCost },
+        },
+        include: { items: true },
+      })
+      for (const item of ret.items) {
+        await changeWarehouseStock(tx, warehouse.id, item.productId, -item.quantity)
+        await tx.stockMovement.create({
+          data: { productId: item.productId, quantity: -item.quantity, type: 'purchase_return', referenceId: ret.id, note: `مرتجع مورد ${invoice.invoiceNumber ?? invoice.id}` },
+        })
+      }
+
+      await ensureStandardAccounts(tx)
+      const [payableAcc, inventoryAcc, vatAcc, returnsAcc] = await Promise.all([
+        findAccByCode('2111', tx), findAccByCode('1131', tx),
+        findAccByCode('2121', tx), findAccByCode('512', tx),
+      ])
+      if (!payableAcc || !inventoryAcc || !returnsAcc) throw new Error('حساب الموردين أو المخزون أو مردودات المشتريات غير موجود')
+      const lines: { accountId: number; debit: number; credit: number; description?: string }[] = [
+        { accountId: payableAcc.id, debit: supplierCredit, credit: 0, description: 'إشعار دائن من المورد' },
+        { accountId: inventoryAcc.id, debit: 0, credit: inventoryCost, description: 'خروج مخزون مرتجع للمورد' },
+      ]
+      if (taxShare > 0) {
+        if (!vatAcc) throw new Error('حساب ضريبة القيمة المضافة غير موجود')
+        lines.push({ accountId: vatAcc.id, debit: 0, credit: taxShare, description: 'عكس ضريبة مدخلات' })
+      }
+      if (variance > 0) lines.push({ accountId: returnsAcc.id, debit: 0, credit: variance, description: 'مردودات مشتريات / فرق تكلفة' })
+      else if (variance < 0) lines.push({ accountId: returnsAcc.id, debit: Math.abs(variance), credit: 0, description: 'فرق تكلفة مردودات مشتريات' })
+      await autoJE({
+        date: new Date(ret.returnDate),
+        description: `مرتجع مشتريات - PR-${ret.id}`,
+        reference: invoice.invoiceNumber ?? `INV-${invoice.id}`,
+        source: 'purchase_return',
+        sourceId: ret.id,
+        lines,
+        db: tx,
+      })
+      return { ...ret, taxAmount: taxShare, supplierCredit }
+    })
   })
 
   // ─── PURCHASE REQUESTS ─────────────────────────────────────────
@@ -773,6 +1017,10 @@ function setupIpcHandlers() {
 
   // ─── POS ───────────────────────────────────────────────────────
   ipcHandle('pos:createOrder', async (_, { items, customerId, ...header }) => {
+    if (!['cash', 'card', 'instapay', 'vodafone', 'credit'].includes(header.paymentMethod ?? 'cash')) {
+      throw new Error('طريقة دفع غير مدعومة')
+    }
+    if (header.paymentMethod === 'credit' && !customerId) throw new Error('اختر العميل أولاً لتسجيل الفاتورة آجلاً')
     if (!Array.isArray(items) || items.length === 0) throw new Error('أضف صنفًا واحدًا على الأقل')
     for (const item of items) {
       if (!Number.isInteger(item.productId) || !Number.isFinite(item.quantity) || item.quantity <= 0) {
@@ -789,6 +1037,10 @@ function setupIpcHandlers() {
       })
       const costByProduct = new Map(products.map(product => [product.id, product.costPrice]))
       if (products.length !== productIds.length) throw new Error('يوجد منتج غير موجود أو غير نشط')
+      if (header.paymentMethod === 'credit') {
+        const customer = await tx.customer.findUnique({ where: { id: customerId }, select: { id: true } })
+        if (!customer) throw new Error('العميل المحدد غير موجود')
+      }
       const o = await tx.posOrder.create({
         data: {
           orderNumber: `ORD-${num}`,
@@ -826,7 +1078,7 @@ function setupIpcHandlers() {
 
   ipcHandle('pos:getOrders', (_, limit = 100) =>
     prisma.posOrder.findMany({
-      include: { items: { include: { product: true } }, customer: true },
+      include: { items: { include: { product: true } }, customer: true, payments: true, returns: { select: { total: true } } },
       orderBy: { createdAt: 'desc' },
       take: limit,
     })
@@ -921,7 +1173,7 @@ function setupIpcHandlers() {
         if (quantity > soldQuantity - alreadyReturned) {
           throw new Error(`كمية المرتجع تتجاوز الكمية المباعة للصنف ${soldItems[0].productName}`)
         }
-        const unitPrice = soldItems[0].unitPrice
+        const unitPrice = soldItems.reduce((sum, item) => sum + item.unitPrice * item.quantity, 0) / soldQuantity
         return {
           productId,
           productName: soldItems[0].productName,
@@ -945,11 +1197,13 @@ function setupIpcHandlers() {
       }
 
       await ensureStandardAccounts(tx)
-      const [salesAcc, cashAcc, bankAcc, vatAcc, cogsAcc, invAcc] = await Promise.all([
-        findAccByCode('4111', tx), findAccByCode('1111', tx), findAccByCode('1112', tx),
+      const [salesAcc, cashAcc, bankAcc, receivableAcc, vatAcc, cogsAcc, invAcc] = await Promise.all([
+        findAccByCode('412', tx), findAccByCode('1111', tx), findAccByCode('1112', tx), findAccByCode('1121', tx),
         findAccByCode('2121', tx), findAccByCode('521', tx), findAccByCode('1131', tx),
       ])
-      const refundAcc = order.paymentMethod === 'cash' ? cashAcc : bankAcc
+      const refundAcc = order.paymentMethod === 'credit'
+        ? receivableAcc
+        : order.paymentMethod === 'cash' ? cashAcc : bankAcc
       if (!salesAcc || !refundAcc || !cogsAcc || !invAcc) {
         throw new Error('تعذر إيجاد حسابات مرتجع المبيعات والنقدية/البنك والمخزون والتكلفة')
       }
@@ -1694,7 +1948,15 @@ function setupIpcHandlers() {
 
   // ─── EXPENSES ──────────────────────────────────────────────────
   ipcHandle('expenseCategories:getAll', () =>
-    prisma.expenseCategory.findMany({ orderBy: { name: 'asc' } })
+    prisma.expenseCategory.findMany({ include: { account: true }, orderBy: { name: 'asc' } })
+  )
+
+  ipcHandle('expenseCategories:getAccounts', () =>
+    prisma.account.findMany({
+      where: { type: 'expense', isActive: true, code: { startsWith: '6' }, children: { none: {} } },
+      select: { id: true, code: true, name: true },
+      orderBy: { code: 'asc' },
+    })
   )
 
   ipcHandle('expenseCategories:create', (_, data) =>
@@ -1728,7 +1990,7 @@ function setupIpcHandlers() {
     return prisma.$transaction(async (tx) => {
       const expense = await tx.expense.create({ data, include: { category: true } })
       await postExpenseJE(
-        { id: expense.id, amount: expense.amount, description: expense.description, date: data.date || new Date(), categoryName: expense.category?.name },
+        { id: expense.id, amount: expense.amount, description: expense.description, date: data.date || new Date(), categoryName: expense.category?.name, categoryAccountId: expense.category?.accountId },
         data.paymentMethod,
         tx,
       )
@@ -1931,15 +2193,20 @@ function setupIpcHandlers() {
     })
   }
 
-  async function postSaleJE(order: { id: number; orderNumber: string; createdAt: Date; total: number; subtotal: number; discountAmount: number; taxAmount: number; paymentMethod: string; items: { productId: number; quantity: number; unitCost: number }[] }, db: AccountingDb = prisma) {
+  async function postSaleJE(order: { id: number; orderNumber: string; createdAt: Date; customerId?: number | null; total: number; subtotal: number; discountAmount: number; taxAmount: number; paymentMethod: string; items: { productId: number; quantity: number; unitCost: number }[] }, db: AccountingDb = prisma) {
     await ensureStandardAccounts(db)
-    const [cashAcc, bankAcc, salesAcc, vatAcc, cogsAcc, invAcc] = await Promise.all([
-      findAccByCode('1111', db), findAccByCode('1112', db),
+    const [cashAcc, bankAcc, receivableAcc, salesAcc, vatAcc, cogsAcc, invAcc] = await Promise.all([
+      findAccByCode('1111', db), findAccByCode('1112', db), findAccByCode('1121', db),
       findAccByCode('4111', db), findAccByCode('2121', db),
       findAccByCode('521', db),  findAccByCode('1131', db),
     ])
-    const drAcc = order.paymentMethod === 'cash' ? cashAcc : bankAcc
-    if (!drAcc || !salesAcc) throw new Error('تعذر إيجاد حسابات النقدية/المبيعات في دليل الحسابات')
+    const drAcc = order.paymentMethod === 'credit'
+      ? receivableAcc
+      : order.paymentMethod === 'cash' ? cashAcc : bankAcc
+    if (!drAcc || !salesAcc) throw new Error('تعذر إيجاد حساب النقدية/البنوك/العملاء أو المبيعات في دليل الحسابات')
+    if (order.paymentMethod === 'credit' && !order.customerId) {
+      throw new Error('يجب تحديد العميل عند تسجيل البيع الآجل')
+    }
     const discountAmount = Number(order.discountAmount ?? 0)
     if (!Number.isFinite(discountAmount) || discountAmount < 0 || discountAmount > order.subtotal) {
       throw new Error('قيمة خصم فاتورة البيع غير صالحة')
@@ -1985,13 +2252,20 @@ function setupIpcHandlers() {
     }
   }
 
-  async function postExpenseJE(expense: { id: number; amount: number; description: string | null; date: Date; categoryName?: string | null }, paymentMethod?: string | null, db: AccountingDb = prisma) {
+  async function postExpenseJE(expense: { id: number; amount: number; description: string | null; date: Date; categoryName?: string | null; categoryAccountId?: number | null }, paymentMethod?: string | null, db: AccountingDb = prisma) {
     await ensureStandardAccounts(db)
-    const [expAcc, cashAcc, bankAcc] = await Promise.all([
+    const [defaultExpenseAcc, cashAcc, bankAcc] = await Promise.all([
       findAccByCode('61', db), findAccByCode('1111', db), findAccByCode('1112', db),
     ])
+    const mappedExpenseAcc = expense.categoryAccountId
+      ? await db.account.findUnique({ where: { id: expense.categoryAccountId }, select: { id: true, code: true, type: true, isActive: true } })
+      : null
+    if (expense.categoryAccountId && (!mappedExpenseAcc || mappedExpenseAcc.type !== 'expense' || !mappedExpenseAcc.isActive || !mappedExpenseAcc.code.startsWith('6'))) {
+      throw new Error('الحساب المرتبط بنوع المصروف غير نشط أو ليس حساب مصروفات')
+    }
+    const expAcc = mappedExpenseAcc ?? defaultExpenseAcc
     const crAcc = (!paymentMethod || paymentMethod === 'cash') ? cashAcc : bankAcc
-    if (!expAcc || !crAcc) throw new Error('تعذر إيجاد حسابات المصاريف/النقدية في دليل الحسابات')
+    if (!expAcc || !crAcc) throw new Error('تعذر إيجاد حساب المصروف أو النقدية/البنك في دليل الحسابات')
     const desc = [expense.categoryName, expense.description].filter(Boolean).join(' - ')
     return autoJE({
       date: new Date(expense.date),
@@ -2533,74 +2807,142 @@ function setupIpcHandlers() {
   ipcHandle('reports:financial', async (_, { from, to }: { from?: string; to?: string } = {}) => {
     const dateFilter: any = {}
     if (from) { const d = new Date(from); d.setUTCHours(0, 0, 0, 0); dateFilter.gte = d }
-    if (to)   { const d = new Date(to);   d.setUTCDate(d.getUTCDate() + 1); d.setUTCHours(0, 0, 0, 0); dateFilter.lt = d }
+    if (to)   { const d = new Date(to); d.setUTCDate(d.getUTCDate() + 1); d.setUTCHours(0, 0, 0, 0); dateFilter.lt = d }
+    if (from && to && new Date(from) >= new Date(to + 'T23:59:59.999Z')) throw new Error('تاريخ بداية التقرير يجب أن يسبق تاريخ النهاية')
 
-    const salesWhere: any  = { status: 'completed', ...(Object.keys(dateFilter).length ? { createdAt: dateFilter } : {}) }
-    const purWhere: any    = Object.keys(dateFilter).length ? { invoiceDate: dateFilter } : {}
-    const expWhere: any    = Object.keys(dateFilter).length ? { date: dateFilter } : {}
-
-    const [orders, invoices, expenses, bankAccounts, products] = await Promise.all([
-      prisma.posOrder.findMany({ where: salesWhere, include: { items: { include: { product: true } } } }),
-      prisma.purchaseInvoice.findMany({ where: { ...purWhere, status: 'confirmed' }, include: { items: { include: { product: true } } } }),
+    const salesWhere: any = { status: 'completed', ...(Object.keys(dateFilter).length ? { createdAt: dateFilter } : {}) }
+    const purWhere: any = Object.keys(dateFilter).length ? { invoiceDate: dateFilter } : {}
+    const expWhere: any = Object.keys(dateFilter).length ? { date: dateFilter } : {}
+    const [orders, invoices, expenses, bankAccounts, salesReturns, purchaseReturns] = await Promise.all([
+      prisma.posOrder.findMany({ where: salesWhere }),
+      prisma.purchaseInvoice.findMany({ where: { ...purWhere, status: 'confirmed' } }),
       prisma.expense.findMany({ where: expWhere, include: { category: true } }),
       prisma.bankAccount.findMany({ where: { isActive: true } }),
-      prisma.product.findMany({ where: { isActive: true } }),
+      prisma.saleReturn.findMany({ where: Object.keys(dateFilter).length ? { returnDate: dateFilter } : {}, include: { order: true } }),
+      prisma.purchaseReturn.findMany({ where: Object.keys(dateFilter).length ? { returnDate: dateFilter } : {}, include: { invoice: true } }),
     ])
 
-    // VAT detail is sourced from confirmed source documents; financial totals below
-    // are sourced from posted double-entry journals so returns and manual entries
-    // are included and historical COGS does not depend on today's product cost.
-    const totalVatOut = orders.reduce((s, o) => s + o.taxAmount, 0)
-    const totalPurchases = invoices.reduce((s, i) => s + i.subtotal, 0)
-    const totalVatIn = invoices.reduce((s, i) => s + i.taxAmount, 0)
+    const saleReturnTax = salesReturns.reduce((sum, ret) =>
+      sum + (ret.order.subtotal > 0 ? ret.order.taxAmount * ret.total / ret.order.subtotal : 0), 0)
+    const purchaseReturnTax = purchaseReturns.reduce((sum, ret) =>
+      sum + (ret.invoice.subtotal > 0 ? ret.invoice.taxAmount * ret.total / ret.invoice.subtotal : 0), 0)
+    const totalVatOut = orders.reduce((sum, order) => sum + order.taxAmount, 0) - saleReturnTax
+    const totalPurchases = invoices.reduce((sum, invoice) => sum + invoice.subtotal, 0) -
+      purchaseReturns.reduce((sum, ret) => sum + ret.total, 0)
+    const totalVatIn = invoices.reduce((sum, invoice) => sum + invoice.taxAmount, 0) - purchaseReturnTax
 
-    // Trial balance from actual posted journal entries
-    const jeWhere: any = { status: 'posted' }
-    if (Object.keys(dateFilter).length) jeWhere.date = dateFilter
+    // Period trial balance is built only from posted ledger entries.
+    const periodWhere: any = { status: 'posted' }
+    if (Object.keys(dateFilter).length) periodWhere.date = dateFilter
     const glLines = await prisma.journalEntryLine.findMany({
-      where: { entry: jeWhere },
+      where: { entry: periodWhere },
       include: { account: true },
     })
     const tbMap = new Map<number, { account: any; debit: number; credit: number }>()
-    for (const l of glLines) {
-      if (!tbMap.has(l.accountId)) tbMap.set(l.accountId, { account: l.account, debit: 0, credit: 0 })
-      const row = tbMap.get(l.accountId)!
-      row.debit  += l.debit
-      row.credit += l.credit
+    for (const line of glLines) {
+      if (!tbMap.has(line.accountId)) tbMap.set(line.accountId, { account: line.account, debit: 0, credit: 0 })
+      const row = tbMap.get(line.accountId)!
+      row.debit += line.debit
+      row.credit += line.credit
     }
-    const trialBalance = Array.from(tbMap.values())
-      .sort((a, b) => a.account.code.localeCompare(b.account.code, undefined, { numeric: true }))
+    const openingTbMap = new Map<number, { account: any; debit: number; credit: number }>()
+    if (from) {
+      const openingDate = new Date(from)
+      openingDate.setUTCHours(0, 0, 0, 0)
+      const openingLines = await prisma.journalEntryLine.findMany({
+        where: { entry: { status: 'posted', date: { lt: openingDate } } },
+        include: { account: true },
+      })
+      for (const line of openingLines) {
+        const row = openingTbMap.get(line.accountId) ?? { account: line.account, debit: 0, credit: 0 }
+        row.debit += line.debit
+        row.credit += line.credit
+        openingTbMap.set(line.accountId, row)
+      }
+    }
+    const allTbIds = new Set([...tbMap.keys(), ...openingTbMap.keys()])
+    const trialBalance = [...allTbIds].map(accountId => {
+      const period = tbMap.get(accountId)
+      const opening = openingTbMap.get(accountId)
+      const account = period?.account ?? opening!.account
+      const debit = period?.debit ?? 0
+      const credit = period?.credit ?? 0
+      const openingBalance = account.normalBalance === 'debit'
+        ? (opening?.debit ?? 0) - (opening?.credit ?? 0)
+        : (opening?.credit ?? 0) - (opening?.debit ?? 0)
+      const movement = account.normalBalance === 'debit' ? debit - credit : credit - debit
+      return {
+        code: account.code,
+        name: account.name,
+        type: account.type,
+        openingBalance,
+        debit,
+        credit,
+        closingBalance: openingBalance + movement,
+      }
+    }).sort((x, y) => x.code.localeCompare(y.code, undefined, { numeric: true }))
 
-    // Use posted ledger balances as the source of truth for financial statements.
-    // Account code 5 = cost of sales; code 6 = operating expenses.
     let totalRevenue = 0
     let cogs = 0
     let totalExpenses = 0
     const expByCategory: Record<string, number> = {}
-    let inventoryValue = 0
-    let totalCash = 0
-    let totalBank = 0
-    for (const row of trialBalance) {
+    for (const row of tbMap.values()) {
       const account = row.account
       const netDebit = row.debit - row.credit
       const netCredit = row.credit - row.debit
       if (account.type === 'revenue') totalRevenue += netCredit
-      if (account.type === 'expense' && String(account.code).startsWith('52')) cogs += netDebit
+      if (account.type === 'expense' && (String(account.code).startsWith('52') || String(account.code) === '512')) cogs += netDebit
       if (account.type === 'expense' && String(account.code).startsWith('6')) {
-        const amount = netDebit
-        totalExpenses += amount
+        totalExpenses += netDebit
         const category = account.name || 'مصروفات تشغيلية'
-        expByCategory[category] = (expByCategory[category] ?? 0) + amount
+        expByCategory[category] = (expByCategory[category] ?? 0) + netDebit
       }
-      if (account.type === 'asset' && String(account.code).startsWith('113')) {
-        inventoryValue += account.normalBalance === 'credit' ? -netCredit : netDebit
-      }
-      if (account.code === '1111') totalCash += account.normalBalance === 'credit' ? -netCredit : netDebit
-      if (account.code === '1112') totalBank += account.normalBalance === 'credit' ? -netCredit : netDebit
     }
     const grossProfit = totalRevenue - cogs
     const netProfit = grossProfit - totalExpenses
     const vatNetPayable = totalVatOut - totalVatIn
+
+    // Balance sheet is an as-of-date statement, not the movement within the selected income-statement period.
+    const balanceDate = to ? new Date(to) : new Date()
+    balanceDate.setUTCDate(balanceDate.getUTCDate() + 1)
+    balanceDate.setUTCHours(0, 0, 0, 0)
+    const [allAccounts, balanceLines] = await Promise.all([
+      prisma.account.findMany({ where: { isActive: true }, orderBy: { code: 'asc' } }),
+      prisma.journalEntryLine.findMany({
+        where: { entry: { status: 'posted', date: { lt: balanceDate } } },
+        select: { accountId: true, debit: true, credit: true },
+      }),
+    ])
+    const balanceMap = new Map<number, { debit: number; credit: number }>()
+    for (const line of balanceLines) {
+      const row = balanceMap.get(line.accountId) ?? { debit: 0, credit: 0 }
+      row.debit += line.debit
+      row.credit += line.credit
+      balanceMap.set(line.accountId, row)
+    }
+    const balanceRows = allAccounts.map(account => {
+      const row = balanceMap.get(account.id) ?? { debit: 0, credit: 0 }
+      const balance = account.type === 'asset' || account.type === 'expense'
+        ? row.debit - row.credit
+        : row.credit - row.debit
+      return { id: account.id, code: account.code, name: account.name, type: account.type, balance }
+    }).filter(row => Math.abs(row.balance) > 0.005)
+
+    const assets = balanceRows.filter(row => row.type === 'asset')
+    const liabilities = balanceRows.filter(row => row.type === 'liability')
+    const equity = balanceRows.filter(row => row.type === 'equity')
+    const balanceRevenue = balanceRows.filter(row => row.type === 'revenue').reduce((sum, row) => sum + row.balance, 0)
+    const balanceExpenses = balanceRows.filter(row => row.type === 'expense').reduce((sum, row) => sum + row.balance, 0)
+    const currentEarnings = balanceRevenue - balanceExpenses
+    const assetsTotal = assets.reduce((sum, row) => sum + row.balance, 0)
+    const liabilitiesTotal = liabilities.reduce((sum, row) => sum + row.balance, 0)
+    const equityTotal = equity.reduce((sum, row) => sum + row.balance, 0) + currentEarnings
+    const liabilitiesAndEquity = liabilitiesTotal + equityTotal
+    const inventoryValue = assets.filter(row => row.code.startsWith('113')).reduce((sum, row) => sum + row.balance, 0)
+    const totalCash = balanceRows.find(row => row.code === '1111')?.balance ?? 0
+    const totalBank = balanceRows.find(row => row.code === '1112')?.balance ?? 0
+    const receivables = assets.filter(row => row.code.startsWith('112')).reduce((sum, row) => sum + row.balance, 0)
+    const payables = liabilities.filter(row => row.code.startsWith('211')).reduce((sum, row) => sum + row.balance, 0)
 
     return {
       period: { from, to },
@@ -2614,6 +2956,15 @@ function setupIpcHandlers() {
       inventory: { value: inventoryValue },
       banks: { cash: totalCash, bank: totalBank, accounts: bankAccounts },
       trialBalance,
+      balanceSheet: {
+        asOf: to ?? new Date().toISOString().slice(0, 10),
+        assets, liabilities, equity,
+        currentEarnings,
+        assetsTotal, liabilitiesTotal, equityTotal, liabilitiesAndEquity,
+        difference: assetsTotal - liabilitiesAndEquity,
+        isBalanced: Math.abs(assetsTotal - liabilitiesAndEquity) <= 0.05,
+        receivables, payables,
+      },
       ordersCount: orders.length,
       invoicesCount: invoices.length,
     }
@@ -2622,55 +2973,230 @@ function setupIpcHandlers() {
   // ─── EXTENDED REPORTS ─────────────────────────────────────────
 
   ipcHandle('reports:customerStatement', async (_, { customerId, from, to }: any = {}) => {
-    const where: any = { status: 'completed' }
-    if (customerId) where.customerId = Number(customerId)
-    if (from) { const d = new Date(from); d.setUTCHours(0,0,0,0); where.createdAt = { ...where.createdAt, gte: d } }
-    if (to)   { const d = new Date(to); d.setUTCDate(d.getUTCDate()+1); d.setUTCHours(0,0,0,0); where.createdAt = { ...where.createdAt, lt: d } }
-    const orders = await prisma.posOrder.findMany({
-      where, include: { customer: true, items: { include: { product: true } } }, orderBy: { createdAt: 'asc' },
+    const id = Number(customerId)
+    if (!Number.isInteger(id) || id <= 0) throw new Error('اختر عميلًا صحيحًا')
+    const dateRange = (value: string, end = false) => {
+      if (!value) return undefined
+      const d = new Date(value)
+      if (Number.isNaN(d.getTime())) throw new Error('نطاق تاريخ غير صحيح')
+      if (end) { d.setUTCDate(d.getUTCDate() + 1); d.setUTCHours(0, 0, 0, 0) }
+      else d.setUTCHours(0, 0, 0, 0)
+      return d
+    }
+    const start = dateRange(from)
+    const end = dateRange(to, true)
+    if (start && end && start >= end) throw new Error('تاريخ البداية يجب أن يسبق تاريخ النهاية')
+    const orderWhere: any = { customerId: id, status: 'completed', paymentMethod: 'credit' }
+    const paymentWhere: any = { customerId: id }
+    const returnWhere: any = { order: { customerId: id, paymentMethod: 'credit', status: 'completed' } }
+    if (start) {
+      orderWhere.createdAt = { gte: start, ...(end ? { lt: end } : {}) }
+      paymentWhere.date = { gte: start, ...(end ? { lt: end } : {}) }
+      returnWhere.returnDate = { gte: start, ...(end ? { lt: end } : {}) }
+    } else if (end) {
+      orderWhere.createdAt = { lt: end }
+      paymentWhere.date = { lt: end }
+      returnWhere.returnDate = { lt: end }
+    }
+    const openingWhereOrders: any = { customerId: id, status: 'completed', paymentMethod: 'credit', ...(start ? { createdAt: { lt: start } } : { id: -1 }) }
+    const openingWherePayments: any = { customerId: id, ...(start ? { date: { lt: start } } : { id: -1 }) }
+    const openingWhereReturns: any = { order: { customerId: id, paymentMethod: 'credit', status: 'completed' }, ...(start ? { returnDate: { lt: start } } : { id: -1 }) }
+    const [orders, payments, returns, customer, openingOrders, openingPayments, openingReturns] = await Promise.all([
+      prisma.posOrder.findMany({ where: orderWhere, orderBy: { createdAt: 'asc' } }),
+      prisma.customerPayment.findMany({ where: paymentWhere, orderBy: { date: 'asc' }, include: { order: true } }),
+      prisma.saleReturn.findMany({ where: returnWhere, orderBy: { returnDate: 'asc' }, include: { order: true } }),
+      prisma.customer.findUnique({ where: { id } }),
+      prisma.posOrder.aggregate({ where: openingWhereOrders, _sum: { total: true } }),
+      prisma.customerPayment.aggregate({ where: openingWherePayments, _sum: { amount: true } }),
+      prisma.saleReturn.findMany({ where: openingWhereReturns, include: { order: true } }),
+    ])
+    if (!customer) throw new Error('العميل غير موجود')
+    const returnValue = (ret: any) => {
+      const ratio = ret.order.subtotal > 0 ? ret.total / ret.order.subtotal : 0
+      return Math.max(0, ret.total - (ret.order.discountAmount ?? 0) * ratio + (ret.order.taxAmount ?? 0) * ratio)
+    }
+    const openingReturnTotal = openingReturns.reduce((sum: number, ret: any) => sum + returnValue(ret), 0)
+    const openingBalance = (openingOrders._sum.total ?? 0) - (openingPayments._sum.amount ?? 0) - openingReturnTotal
+    const events = [
+      ...orders.map(o => ({ date: o.createdAt, description: `فاتورة مبيعات آجلة ${o.orderNumber}`, amount: o.total, debit: o.total, credit: 0, kind: 'sale' })),
+      ...payments.map(p => ({ date: p.date, description: `تحصيل على ${p.order.orderNumber}${p.reference ? ` - ${p.reference}` : ''}`, amount: -p.amount, debit: 0, credit: p.amount, kind: 'receipt' })),
+      ...returns.map(ret => { const value = returnValue(ret); return { date: ret.returnDate, description: `إشعار دائن / مرتجع ${ret.id}`, amount: -value, debit: 0, credit: value, kind: 'return' } }),
+    ].sort((x, y) => new Date(x.date).getTime() - new Date(y.date).getTime())
+    let balance = openingBalance
+    const rows = events.map(event => {
+      balance += event.amount
+      return { ...event, balance }
     })
-    let running = 0
-    const rows = orders.map(o => { running += o.total; return { ...o, runningBalance: running } })
-    return { rows, total: orders.reduce((s, o) => s + o.total, 0), count: orders.length }
+    const totalSales = orders.reduce((sum, o) => sum + o.total, 0)
+    const totalPayments = payments.reduce((sum, p) => sum + p.amount, 0)
+    const totalReturns = returns.reduce((sum, ret) => sum + returnValue(ret), 0)
+    return { customer, rows, openingBalance, total: balance, balance, totalSales, totalPayments, totalReturns, count: rows.length }
   })
 
   ipcHandle('reports:supplierStatement', async (_, { supplierId, from, to }: any = {}) => {
-    const where: any = { status: 'confirmed' }
-    if (supplierId) where.supplierId = Number(supplierId)
-    if (from) { const d = new Date(from); d.setUTCHours(0,0,0,0); where.invoiceDate = { ...where.invoiceDate, gte: d } }
-    if (to)   { const d = new Date(to); d.setUTCDate(d.getUTCDate()+1); d.setUTCHours(0,0,0,0); where.invoiceDate = { ...where.invoiceDate, lt: d } }
-    const invoices = await prisma.purchaseInvoice.findMany({
-      where, include: { supplier: true, items: { include: { product: true } } }, orderBy: { invoiceDate: 'asc' },
+    const id = Number(supplierId)
+    if (!Number.isInteger(id) || id <= 0) throw new Error('اختر موردًا صحيحًا')
+    const dateRange = (value: string, end = false) => {
+      if (!value) return undefined
+      const d = new Date(value)
+      if (Number.isNaN(d.getTime())) throw new Error('نطاق تاريخ غير صحيح')
+      if (end) { d.setUTCDate(d.getUTCDate() + 1); d.setUTCHours(0, 0, 0, 0) }
+      else d.setUTCHours(0, 0, 0, 0)
+      return d
+    }
+    const start = dateRange(from)
+    const end = dateRange(to, true)
+    if (start && end && start >= end) throw new Error('تاريخ البداية يجب أن يسبق تاريخ النهاية')
+    const invoiceWhere: any = { supplierId: id, status: 'confirmed' }
+    const paymentWhere: any = { supplierId: id }
+    const returnWhere: any = { invoice: { supplierId: id, status: 'confirmed' } }
+    if (start) {
+      invoiceWhere.invoiceDate = { gte: start, ...(end ? { lt: end } : {}) }
+      paymentWhere.date = { gte: start, ...(end ? { lt: end } : {}) }
+      returnWhere.returnDate = { gte: start, ...(end ? { lt: end } : {}) }
+    } else if (end) {
+      invoiceWhere.invoiceDate = { lt: end }
+      paymentWhere.date = { lt: end }
+      returnWhere.returnDate = { lt: end }
+    }
+    const openingWhereInvoices: any = { supplierId: id, status: 'confirmed', ...(start ? { invoiceDate: { lt: start } } : { id: -1 }) }
+    const openingWherePayments: any = { supplierId: id, ...(start ? { date: { lt: start } } : { id: -1 }) }
+    const openingWhereReturns: any = { invoice: { supplierId: id, status: 'confirmed' }, ...(start ? { returnDate: { lt: start } } : { id: -1 }) }
+    const [invoices, payments, returns, supplier, openingInvoices, openingPayments, openingReturns] = await Promise.all([
+      prisma.purchaseInvoice.findMany({ where: invoiceWhere, orderBy: { invoiceDate: 'asc' } }),
+      prisma.supplierPayment.findMany({ where: paymentWhere, orderBy: { date: 'asc' }, include: { invoice: true } }),
+      prisma.purchaseReturn.findMany({ where: returnWhere, orderBy: { returnDate: 'asc' }, include: { invoice: true } }),
+      prisma.supplier.findUnique({ where: { id } }),
+      prisma.purchaseInvoice.aggregate({ where: openingWhereInvoices, _sum: { total: true } }),
+      prisma.supplierPayment.aggregate({ where: openingWherePayments, _sum: { amount: true } }),
+      prisma.purchaseReturn.findMany({ where: openingWhereReturns, include: { invoice: true } }),
+    ])
+    if (!supplier) throw new Error('المورد غير موجود')
+    const returnValue = (ret: any) => ret.total + (ret.invoice.subtotal > 0 ? ret.invoice.taxAmount * ret.total / ret.invoice.subtotal : 0)
+    const openingReturnTotal = openingReturns.reduce((sum: number, ret: any) => sum + returnValue(ret), 0)
+    const openingBalance = (openingInvoices._sum.total ?? 0) - (openingPayments._sum.amount ?? 0) - openingReturnTotal
+    const events = [
+      ...invoices.map(i => ({ date: i.invoiceDate, description: `فاتورة مشتريات ${i.invoiceNumber ?? `INV-${i.id}`}`, amount: i.total, debit: 0, credit: i.total, kind: 'purchase' })),
+      ...payments.map(p => ({ date: p.date, description: `سداد على ${p.invoice.invoiceNumber ?? `INV-${p.invoice.id}`}${p.reference ? ` - ${p.reference}` : ''}`, amount: -p.amount, debit: p.amount, credit: 0, kind: 'payment' })),
+      ...returns.map(ret => { const value = returnValue(ret); return { date: ret.returnDate, description: `إشعار دائن / مرتجع مشتريات ${ret.id}`, amount: -value, debit: value, credit: 0, kind: 'return' } }),
+    ].sort((x, y) => new Date(x.date).getTime() - new Date(y.date).getTime())
+    let balance = openingBalance
+    const rows = events.map(event => {
+      balance += event.amount
+      return { ...event, balance }
     })
-    let running = 0
-    const rows = invoices.map(i => { running += i.total; return { ...i, runningBalance: running } })
-    return { rows, total: invoices.reduce((s, i) => s + i.total, 0), count: invoices.length }
+    const totalInvoices = invoices.reduce((sum, i) => sum + i.total, 0)
+    const totalPayments = payments.reduce((sum, p) => sum + p.amount, 0)
+    const totalReturns = returns.reduce((sum, ret) => sum + returnValue(ret), 0)
+    return { supplier, rows, openingBalance, total: balance, balance, totalInvoices, totalPayments, totalReturns, count: rows.length }
   })
 
   ipcHandle('reports:vatDetails', async (_, { from, to }: any = {}) => {
     const df: any = {}
-    if (from) { const d = new Date(from); d.setUTCHours(0,0,0,0); df.gte = d }
-    if (to)   { const d = new Date(to); d.setUTCDate(d.getUTCDate()+1); d.setUTCHours(0,0,0,0); df.lte = d }
-    const [orders, invoices] = await Promise.all([
-      prisma.posOrder.findMany({ where: { status: 'completed', ...(df.gte ? { createdAt: df } : {}) }, include: { customer: true }, orderBy: { createdAt: 'asc' } }),
-      prisma.purchaseInvoice.findMany({ where: { status: 'confirmed', ...(df.gte ? { invoiceDate: df } : {}) }, include: { supplier: true }, orderBy: { invoiceDate: 'asc' } }),
+    if (from) { const d = new Date(from); d.setUTCHours(0, 0, 0, 0); df.gte = d }
+    if (to)   { const d = new Date(to); d.setUTCDate(d.getUTCDate() + 1); d.setUTCHours(0, 0, 0, 0); df.lt = d }
+    if (from && to && new Date(from) >= new Date(to + 'T23:59:59.999Z')) throw new Error('تاريخ بداية التقرير يجب أن يسبق تاريخ النهاية')
+    const [orders, invoices, salesReturns, purchaseReturns] = await Promise.all([
+      prisma.posOrder.findMany({ where: { status: 'completed', ...(Object.keys(df).length ? { createdAt: df } : {}) }, include: { customer: true }, orderBy: { createdAt: 'asc' } }),
+      prisma.purchaseInvoice.findMany({ where: { status: 'confirmed', ...(Object.keys(df).length ? { invoiceDate: df } : {}) }, include: { supplier: true }, orderBy: { invoiceDate: 'asc' } }),
+      prisma.saleReturn.findMany({ where: Object.keys(df).length ? { returnDate: df } : {}, include: { order: { include: { customer: true } } }, orderBy: { returnDate: 'asc' } }),
+      prisma.purchaseReturn.findMany({ where: Object.keys(df).length ? { returnDate: df } : {}, include: { invoice: { include: { supplier: true } } }, orderBy: { returnDate: 'asc' } }),
     ])
     const salesRows = orders.filter(o => o.taxAmount > 0).map(o => ({
       date: o.createdAt, ref: o.orderNumber, party: o.customer?.name ?? 'عميل نقدي',
       type: 'sale', subtotal: o.subtotal, taxRate: o.taxRate, taxAmount: o.taxAmount, total: o.total,
     }))
+    const salesReturnRows = salesReturns.map(ret => {
+      const ratio = ret.order.subtotal > 0 ? ret.total / ret.order.subtotal : 0
+      const subtotal = ret.total - ret.order.discountAmount * ratio
+      const taxAmount = ret.order.taxAmount * ratio
+      return {
+        date: ret.returnDate, ref: `RTN-${ret.id}`, party: ret.order.customer?.name ?? 'عميل نقدي',
+        type: 'sale_return', subtotal: -subtotal, taxRate: ret.order.taxRate, taxAmount: -taxAmount, total: -(subtotal + taxAmount),
+      }
+    })
     const purchaseRows = invoices.filter(i => i.taxAmount > 0).map(i => ({
       date: i.invoiceDate, ref: i.invoiceNumber ?? `INV-${i.id}`, party: i.supplier?.name ?? 'مورد',
       type: 'purchase', subtotal: i.subtotal, taxRate: i.taxRate, taxAmount: i.taxAmount, total: i.total,
     }))
+    const purchaseReturnRows = purchaseReturns.map(ret => {
+      const taxAmount = ret.invoice.subtotal > 0 ? ret.invoice.taxAmount * ret.total / ret.invoice.subtotal : 0
+      return {
+        date: ret.returnDate, ref: `PR-${ret.id}`, party: ret.invoice.supplier?.name ?? 'مورد',
+        type: 'purchase_return', subtotal: -ret.total, taxRate: ret.invoice.taxRate, taxAmount: -taxAmount, total: -(ret.total + taxAmount),
+      }
+    })
+    const salesAll = [...salesRows, ...salesReturnRows].sort((x, y) => new Date(x.date).getTime() - new Date(y.date).getTime())
+    const purchasesAll = [...purchaseRows, ...purchaseReturnRows].sort((x, y) => new Date(x.date).getTime() - new Date(y.date).getTime())
     return {
-      salesRows, purchaseRows,
+      salesRows: salesAll,
+      purchaseRows: purchasesAll,
       totals: {
-        salesSubtotal: salesRows.reduce((s, r) => s + r.subtotal, 0),
-        salesTax:      salesRows.reduce((s, r) => s + r.taxAmount, 0),
-        purchaseSubtotal: purchaseRows.reduce((s, r) => s + r.subtotal, 0),
-        purchaseTax:   purchaseRows.reduce((s, r) => s + r.taxAmount, 0),
+        salesSubtotal: salesAll.reduce((sum, row) => sum + row.subtotal, 0),
+        salesTax: salesAll.reduce((sum, row) => sum + row.taxAmount, 0),
+        purchaseSubtotal: purchasesAll.reduce((sum, row) => sum + row.subtotal, 0),
+        purchaseTax: purchasesAll.reduce((sum, row) => sum + row.taxAmount, 0),
       },
+    }
+  })
+
+  ipcHandle('reports:generalLedger', async (_, { accountId, from, to }: { accountId?: number; from?: string; to?: string } = {}) => {
+    const accounts = await prisma.account.findMany({
+      where: { isActive: true, children: { none: {} } },
+      select: { id: true, code: true, name: true, type: true, normalBalance: true },
+      orderBy: { code: 'asc' },
+    })
+    if (accountId == null) return { accounts, selectedAccount: null, openingBalance: 0, rows: [], totalDebit: 0, totalCredit: 0, closingBalance: 0 }
+    const id = Number(accountId)
+    if (!Number.isInteger(id) || id <= 0) throw new Error('اختر حسابًا صحيحًا')
+    const account = accounts.find(row => row.id === id)
+    if (!account) throw new Error('الحساب غير موجود أو غير نشط أو ليس حسابًا تفصيليًا')
+    const dateValue = (value: string, end = false) => {
+      if (!value) return undefined
+      const date = new Date(value)
+      if (Number.isNaN(date.getTime())) throw new Error('تاريخ التقرير غير صحيح')
+      if (end) { date.setUTCDate(date.getUTCDate() + 1); date.setUTCHours(0, 0, 0, 0) }
+      else date.setUTCHours(0, 0, 0, 0)
+      return date
+    }
+    const start = from ? dateValue(from) : undefined
+    const end = to ? dateValue(to, true) : undefined
+    if (start && end && start >= end) throw new Error('تاريخ البداية يجب أن يسبق تاريخ النهاية')
+    const [opening, lines] = await Promise.all([
+      start ? prisma.journalEntryLine.aggregate({
+        where: { accountId: id, entry: { status: 'posted', date: { lt: start } } },
+        _sum: { debit: true, credit: true },
+      }) : Promise.resolve({ _sum: { debit: 0, credit: 0 } }),
+      prisma.journalEntryLine.findMany({
+        where: {
+          accountId: id,
+          entry: {
+            status: 'posted',
+            ...(start || end ? { date: { ...(start ? { gte: start } : {}), ...(end ? { lt: end } : {}) } } : {}),
+          },
+        },
+        include: { entry: { select: { id: true, number: true, date: true, description: true, reference: true, source: true } } },
+        orderBy: [{ entry: { date: 'asc' } }, { entryId: 'asc' }, { id: 'asc' }],
+      }),
+    ])
+    const normal = account.normalBalance === 'credit' ? -1 : 1
+    const openingBalance = normal * ((opening._sum.debit ?? 0) - (opening._sum.credit ?? 0))
+    let running = openingBalance
+    const rows = lines.map(line => {
+      const debit = line.debit ?? 0
+      const credit = line.credit ?? 0
+      running += normal * (debit - credit)
+      return {
+        id: line.id, date: line.entry.date, entryNumber: line.entry.number,
+        description: line.description || line.entry.description || line.entry.reference || 'قيد محاسبي',
+        source: line.entry.source, debit, credit, balance: running,
+      }
+    })
+    return {
+      accounts, selectedAccount: account, openingBalance, rows,
+      totalDebit: rows.reduce((sum, row) => sum + row.debit, 0),
+      totalCredit: rows.reduce((sum, row) => sum + row.credit, 0),
+      closingBalance: running,
     }
   })
 
@@ -2736,38 +3262,82 @@ function setupIpcHandlers() {
     }
   })
 
-  ipcHandle('reports:arAging', async (_, { asOf }: any = {}) => {
+  ipcHandle('reports:arAging', async (_, { asOf }: { asOf?: string } = {}) => {
     const cutoff = asOf ? new Date(asOf) : new Date()
+    if (Number.isNaN(cutoff.getTime())) throw new Error('تاريخ تقرير أعمار الديون غير صحيح')
+    cutoff.setUTCHours(23, 59, 59, 999)
     const customers = await prisma.customer.findMany({
-      include: { orders: { where: { status: 'completed' }, orderBy: { createdAt: 'desc' } } },
+      include: {
+        orders: {
+          where: { status: 'completed', paymentMethod: 'credit' },
+          include: { payments: true, returns: true },
+          orderBy: { createdAt: 'desc' },
+        },
+      },
+      orderBy: { name: 'asc' },
     })
-    return customers.filter(c => c.orders.length > 0).map(c => {
-      const last = c.orders[0]
-      const days = Math.floor((cutoff.getTime() - new Date(last.createdAt).getTime()) / 86400000)
-      const total = c.orders.reduce((s, o) => s + o.total, 0)
-      return { id: c.id, name: c.name, phone: c.phone, total, lastDate: last.createdAt, days, count: c.orders.length }
-    }).sort((a, b) => b.total - a.total)
+    const result = customers.map(customer => {
+      const rows = customer.orders.map(order => {
+        const paid = order.payments.reduce((sum, payment) => sum + payment.amount, 0)
+        const returned = order.returns.reduce((sum, ret) => {
+          const ratio = order.subtotal > 0 ? ret.total / order.subtotal : 0
+          return sum + ret.total - Number(order.discountAmount ?? 0) * ratio + Number(order.taxAmount ?? 0) * ratio
+        }, 0)
+        const due = Math.max(0, order.total - paid - returned)
+        const days = Math.max(0, Math.floor((cutoff.getTime() - new Date(order.createdAt).getTime()) / 86400000))
+        return { id: order.id, orderNumber: order.orderNumber, date: order.createdAt, total: order.total, paid, returned, due, days }
+      }).filter(row => row.due > 0.005)
+      const total = rows.reduce((sum, row) => sum + row.due, 0)
+      const bucket = (days: number) => days <= 30 ? 'c0' : days <= 60 ? 'c30' : days <= 90 ? 'c60' : 'c90'
+      const aging = { c0: 0, c30: 0, c60: 0, c90: 0 }
+      for (const row of rows) aging[bucket(row.days) as keyof typeof aging] += row.due
+      const oldest = rows.reduce<Date | null>((value, row) => !value || new Date(row.date) < value ? new Date(row.date) : value, null)
+      const latest = rows.reduce<Date | null>((value, row) => !value || new Date(row.date) > value ? new Date(row.date) : value, null)
+      const oldestDueDate = oldest
+      const lastDate = latest
+      const days = latest ? Math.max(0, Math.floor((cutoff.getTime() - latest.getTime()) / 86400000)) : 0
+      return { id: customer.id, name: customer.name, phone: customer.phone, rows, total, ...aging, lastDate, oldestDueDate, days, count: rows.length }
+    }).filter(customer => customer.total > 0.005)
+    return result.sort((a, b) => b.total - a.total)
   })
 
-  ipcHandle('reports:apAging', async (_, { asOf }: any = {}) => {
+  ipcHandle('reports:apAging', async (_, { asOf }: { asOf?: string } = {}) => {
     const cutoff = asOf ? new Date(asOf) : new Date()
+    if (Number.isNaN(cutoff.getTime())) throw new Error('تاريخ تقرير أعمار الديون غير صحيح')
+    cutoff.setUTCHours(23, 59, 59, 999)
     const invoices = await prisma.purchaseInvoice.findMany({
-      where: { status: 'confirmed' }, include: { supplier: true }, orderBy: { invoiceDate: 'asc' },
+      where: { status: 'confirmed' },
+      include: { supplier: true, payments: true, returns: true },
+      orderBy: { invoiceDate: 'asc' },
     })
     const map = new Map<number, any>()
-    for (const inv of invoices) {
-      const sid = inv.supplierId ?? 0
-      if (!map.has(sid)) map.set(sid, { supplier: inv.supplier, rows: [], total: 0, c0: 0, c30: 0, c60: 0, c90: 0 })
-      const entry = map.get(sid)!
-      const days = Math.floor((cutoff.getTime() - new Date(inv.invoiceDate).getTime()) / 86400000)
-      entry.rows.push({ ...inv, days })
-      entry.total += inv.total
-      if      (days <= 30) entry.c0  += inv.total
-      else if (days <= 60) entry.c30 += inv.total
-      else if (days <= 90) entry.c60 += inv.total
-      else                 entry.c90 += inv.total
+    for (const invoice of invoices) {
+      const supplierId = invoice.supplierId ?? 0
+      if (!map.has(supplierId)) {
+        map.set(supplierId, {
+          supplier: invoice.supplier, rows: [], total: 0, c0: 0, c30: 0, c60: 0, c90: 0,
+        })
+      }
+      const entry = map.get(supplierId)!
+      const paid = invoice.payments.reduce((sum, payment) => sum + payment.amount, 0)
+      const returned = invoice.returns.reduce((sum, ret) => {
+        const taxShare = invoice.subtotal > 0
+          ? Math.round(invoice.taxAmount * ret.total / invoice.subtotal * 100) / 100
+          : 0
+        return sum + ret.total + taxShare
+      }, 0)
+      const due = Math.max(0, invoice.total - paid - returned)
+      if (due <= 0.005) continue
+      const days = Math.max(0, Math.floor((cutoff.getTime() - new Date(invoice.invoiceDate).getTime()) / 86400000))
+      const row = { ...invoice, paid, returned, due, days }
+      entry.rows.push(row)
+      entry.total += due
+      if (days <= 30) entry.c0 += due
+      else if (days <= 60) entry.c30 += due
+      else if (days <= 90) entry.c60 += due
+      else entry.c90 += due
     }
-    return Array.from(map.values()).sort((a, b) => b.total - a.total)
+    return Array.from(map.values()).filter(entry => entry.total > 0.005).sort((a, b) => b.total - a.total)
   })
 
   ipcHandle('reports:executiveSummary', async (_, { from, to }: any = {}) => {
@@ -2941,6 +3511,8 @@ function setupIpcHandlers() {
         await tx.saleReturn.deleteMany({})
       }
       if (removeSales) {
+        await tx.customerPayment.deleteMany({})
+        await tx.journalEntry.deleteMany({ where: { source: 'customer_payment' } })
         await tx.posOrderItem.deleteMany({})
         await tx.posOrder.deleteMany({})
         await tx.journalEntry.deleteMany({ where: { source: 'sale' } })
@@ -2952,11 +3524,15 @@ function setupIpcHandlers() {
       }
 
       if (removePurchases) {
+        await tx.supplierPayment.deleteMany({})
+        await tx.journalEntry.deleteMany({ where: { source: { in: ['supplier_payment', 'purchase_return'] } } })
+        await tx.purchaseReturnItem.deleteMany({})
+        await tx.purchaseReturn.deleteMany({})
         await tx.purchaseItem.deleteMany({})
         await tx.purchaseInvoice.deleteMany({})
         await tx.purchaseRequestItem.deleteMany({})
         await tx.purchaseRequest.deleteMany({})
-        await tx.stockMovement.deleteMany({ where: { type: 'purchase' } })
+        await tx.stockMovement.deleteMany({ where: { type: { in: ['purchase', 'purchase_return'] } } })
         await tx.journalEntry.deleteMany({ where: { source: 'purchase' } })
       }
 
@@ -2992,15 +3568,17 @@ function setupIpcHandlers() {
       }
 
       if (all || selected.has('customers')) {
-        // Preserve sales documents when only the customer master data is cleared.
+        // Preserve historical receipts and sales while detaching the optional customer master record.
         await tx.posOrder.updateMany({ data: { customerId: null } })
+        await tx.customerPayment.updateMany({ data: { customerId: null } })
         await tx.customer.deleteMany({})
       }
 
       if (all || selected.has('suppliers')) {
-        // Supplier references are optional; detach them before removing suppliers.
+        // Supplier references are optional; preserve payment history and detach supplier master records.
         await tx.purchaseInvoice.updateMany({ data: { supplierId: null } })
         await tx.purchaseRequest.updateMany({ data: { supplierId: null } })
+        await tx.supplierPayment.updateMany({ data: { supplierId: null } })
         await tx.supplier.deleteMany({})
       }
 

@@ -25,12 +25,16 @@ interface Window {
       update: (data: any) => Promise<any>
       delete: (id: number) => Promise<any>
       addPoints: (data: any) => Promise<any>
+      getPayments: (customerId?: number) => Promise<any[]>
+      receivePayment: (data: any) => Promise<any>
     }
     suppliers: {
       getAll: () => Promise<any[]>
       create: (data: any) => Promise<any>
       update: (data: any) => Promise<any>
       delete: (id: number) => Promise<any>
+      getPayments: (supplierId?: number) => Promise<any[]>
+      payInvoice: (data: any) => Promise<any>
     }
     invoices: {
       getAll: () => Promise<any[]>
@@ -40,6 +44,7 @@ interface Window {
       updateDraft: (data: any) => Promise<any>
       deleteDraft: (id: number) => Promise<any>
       confirmDraft: (id: number) => Promise<any>
+      createReturn: (data: any) => Promise<any>
     }
     purchaseRequests: {
       getAll: () => Promise<any[]>
@@ -111,6 +116,7 @@ interface Window {
       products:          () => Promise<any[]>
       stock:             () => Promise<any[]>
       financial:         (params?: any) => Promise<any>
+      generalLedger:     (params?: any) => Promise<any>
       customerStatement: (params?: any) => Promise<any>
       supplierStatement: (params?: any) => Promise<any>
       vatDetails:        (params?: any) => Promise<any>
@@ -150,6 +156,7 @@ interface Window {
     }
     expenseCategories: {
       getAll:  () => Promise<any[]>
+      getAccounts: () => Promise<{ id: number; code: string; name: string }[]>
       create:  (data: any) => Promise<any>
       update:  (data: any) => Promise<any>
       delete:  (id: number) => Promise<any>

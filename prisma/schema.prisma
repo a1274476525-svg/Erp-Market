@@ -68,6 +68,7 @@ model Product {
   createdAt        DateTime          @default(now())
 
   purchaseItems         PurchaseItem[]
+  purchaseReturnItems   PurchaseReturnItem[]
   purchaseRequestItems  PurchaseRequestItem[]
   saleItems             PosOrderItem[]
   returnItems           SaleReturnItem[]
@@ -127,6 +128,7 @@ model Customer {
   loyaltyPoints Int        @default(0)
   createdAt     DateTime   @default(now())
   orders        PosOrder[]
+  payments      CustomerPayment[]
 }
 
 model Supplier {
@@ -138,6 +140,7 @@ model Supplier {
   createdAt        DateTime          @default(now())
   invoices         PurchaseInvoice[]
   purchaseRequests PurchaseRequest[]
+  payments         SupplierPayment[]
 }
 
 model PurchaseInvoice {
@@ -154,6 +157,8 @@ model PurchaseInvoice {
   status        String         @default("confirmed")
   createdAt     DateTime       @default(now())
   items         PurchaseItem[]
+  payments      SupplierPayment[]
+  returns       PurchaseReturn[]
 }
 
 model PurchaseItem {
@@ -231,6 +236,7 @@ model PosOrder {
   createdAt      DateTime       @default(now())
   items          PosOrderItem[]
   returns        SaleReturn[]
+  payments       CustomerPayment[]
 }
 
 model PosOrderItem {
@@ -393,6 +399,8 @@ model ExpenseCategory {
   id          Int       @id @default(autoincrement())
   name        String    @unique
   description String?
+  accountId   Int?
+  account     Account?  @relation(fields: [accountId], references: [id], onDelete: SetNull)
   createdAt   DateTime  @default(now())
   expenses    Expense[]
 }
@@ -424,6 +432,7 @@ model Account {
   createdAt     DateTime           @default(now())
   journalLines  JournalEntryLine[]
   bankAccounts  BankAccount[]      @relation("BankToChartAccount")
+  expenseCategories ExpenseCategory[]
 }
 
 // ─── BANKS & CASH ──────────────────────────────────────────────
@@ -510,4 +519,60 @@ model JournalEntryLine {
   debit       Float        @default(0)
   credit      Float        @default(0)
   description String?
+}
+
+
+// ─── CUSTOMER RECEIPTS / ACCOUNTS RECEIVABLE ─────────────────────
+model CustomerPayment {
+  id            Int        @id @default(autoincrement())
+  customer      Customer?  @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  customerId    Int?
+  order         PosOrder   @relation(fields: [orderId], references: [id])
+  orderId       Int
+  amount        Float
+  paymentMethod String     @default("cash")
+  date          DateTime   @default(now())
+  reference     String?
+  notes         String?
+  createdAt     DateTime   @default(now())
+}
+
+// ─── SUPPLIER PAYMENTS / ACCOUNTS PAYABLE ─────────────────────────
+model SupplierPayment {
+  id            Int            @id @default(autoincrement())
+  supplier      Supplier?      @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+  supplierId    Int?
+  invoice       PurchaseInvoice @relation(fields: [invoiceId], references: [id])
+  invoiceId     Int
+  amount        Float
+  paymentMethod String         @default("cash")
+  date          DateTime       @default(now())
+  reference     String?
+  notes         String?
+  createdAt     DateTime       @default(now())
+}
+
+
+// ─── PURCHASE RETURNS / SUPPLIER CREDIT NOTES ────────────────────
+model PurchaseReturn {
+  id          Int                   @id @default(autoincrement())
+  invoice     PurchaseInvoice       @relation(fields: [invoiceId], references: [id])
+  invoiceId   Int
+  returnDate  DateTime              @default(now())
+  reason      String?
+  total       Float
+  items       PurchaseReturnItem[]
+}
+
+model PurchaseReturnItem {
+  id          Int            @id @default(autoincrement())
+  purchaseReturn PurchaseReturn @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  returnId    Int
+  product     Product        @relation(fields: [productId], references: [id])
+  productId   Int
+  productName String
+  quantity    Float
+  unitPrice   Float
+  unitCost    Float
+  total       Float
 }

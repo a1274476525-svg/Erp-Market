@@ -36,12 +36,16 @@ contextBridge.exposeInMainWorld('api', {
     update:       (data: any)  => ipcRenderer.invoke('customers:update', data),
     delete:       (id: number) => ipcRenderer.invoke('customers:delete', id),
     addPoints:    (data: any)  => ipcRenderer.invoke('customers:addPoints', data),
+    getPayments:  (customerId?: number) => ipcRenderer.invoke('customers:getPayments', customerId),
+    receivePayment: (data: any) => ipcRenderer.invoke('customers:receivePayment', data),
   },
   suppliers: {
     getAll: () => ipcRenderer.invoke('suppliers:getAll'),
     create: (data: any)  => ipcRenderer.invoke('suppliers:create', data),
     update: (data: any)  => ipcRenderer.invoke('suppliers:update', data),
     delete: (id: number) => ipcRenderer.invoke('suppliers:delete', id),
+    getPayments: (supplierId?: number) => ipcRenderer.invoke('suppliers:getPayments', supplierId),
+    payInvoice: (data: any) => ipcRenderer.invoke('suppliers:payInvoice', data),
   },
   invoices: {
     getAll:       ()           => ipcRenderer.invoke('invoices:getAll'),
@@ -51,6 +55,7 @@ contextBridge.exposeInMainWorld('api', {
     updateDraft:  (data: any)  => ipcRenderer.invoke('invoices:updateDraft', data),
     deleteDraft:  (id: number) => ipcRenderer.invoke('invoices:deleteDraft', id),
     confirmDraft: (id: number) => ipcRenderer.invoke('invoices:confirmDraft', id),
+    createReturn: (data: any) => ipcRenderer.invoke('invoices:createReturn', data),
   },
   purchaseRequests: {
     getAll:       ()           => ipcRenderer.invoke('purchaseRequests:getAll'),
@@ -123,6 +128,7 @@ contextBridge.exposeInMainWorld('api', {
     products:           ()            => ipcRenderer.invoke('reports:products'),
     stock:              ()            => ipcRenderer.invoke('reports:stock'),
     financial:          (params: any) => ipcRenderer.invoke('reports:financial', params),
+    generalLedger:      (params: any) => ipcRenderer.invoke('reports:generalLedger', params),
     customerStatement:  (params: any) => ipcRenderer.invoke('reports:customerStatement', params),
     supplierStatement:  (params: any) => ipcRenderer.invoke('reports:supplierStatement', params),
     vatDetails:         (params: any) => ipcRenderer.invoke('reports:vatDetails', params),
@@ -166,6 +172,7 @@ contextBridge.exposeInMainWorld('api', {
   },
   expenseCategories: {
     getAll:  ()           => ipcRenderer.invoke('expenseCategories:getAll'),
+    getAccounts: () => ipcRenderer.invoke('expenseCategories:getAccounts'),
     create:  (data: any)  => ipcRenderer.invoke('expenseCategories:create', data),
     update:  (data: any)  => ipcRenderer.invoke('expenseCategories:update', data),
     delete:  (id: number) => ipcRenderer.invoke('expenseCategories:delete', id),

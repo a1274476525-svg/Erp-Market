@@ -25,6 +25,7 @@ import PromotionsPage   from './pages/Promotions'
 import SuppliersPage    from './pages/Suppliers'
 import PurchaseRequestsPage from './pages/PurchaseRequests'
 import PurchaseInvoicesPage from './pages/PurchaseInvoices'
+import PurchaseReturnsPage from './pages/PurchaseReturns'
 import StockMovementsPage   from './pages/StockMovements'
 import WasteTrackingPage    from './pages/WasteTracking'
 import InventoryCountPage   from './pages/InventoryCount'
@@ -42,6 +43,7 @@ import ChartOfAccountsPage  from './pages/ChartOfAccounts'
 import BanksPage            from './pages/Banks'
 import FinancialReportsPage from './pages/FinancialReports'
 import JournalEntriesPage   from './pages/JournalEntries'
+import SettlementsPage      from './pages/Settlements'
 
 interface NavItem { to: string; label: string; icon: React.ElementType; exact?: boolean }
 
@@ -147,6 +149,7 @@ function Sidebar() {
           { to: '/suppliers',         label: 'الموردون',       icon: Truck },
           { to: '/purchase-requests', label: 'طلبات الشراء',  icon: ClipboardList },
           { to: '/invoices',          label: 'فواتير الشراء', icon: FileText },
+          { to: '/purchase-returns',   label: 'مرتجعات المشتريات', icon: RotateCcw },
         ]} />
 
         <div className="border-t border-slate-800 pt-1" />
@@ -156,6 +159,7 @@ function Sidebar() {
           { to: '/chart-of-accounts', label: 'دليل الحسابات',  icon: BookOpen },
           { to: '/banks',             label: 'البنوك والصناديق', icon: Landmark },
           { to: '/journal-entries',   label: 'قيود اليومية',    icon: BookOpen },
+          { to: '/settlements',       label: 'التحصيلات وسداد الموردين', icon: Wallet },
         ]} />
 
         <div className="border-t border-slate-800 pt-1" />
@@ -246,6 +250,7 @@ function AppContent() {
             <Route path="/suppliers"          element={<ProtectedRoute path="/suppliers"          element={<SuppliersPage />} />} />
             <Route path="/purchase-requests"  element={<ProtectedRoute path="/purchase-requests"  element={<PurchaseRequestsPage />} />} />
             <Route path="/invoices"           element={<ProtectedRoute path="/invoices"           element={<PurchaseInvoicesPage />} />} />
+            <Route path="/purchase-returns" element={<ProtectedRoute path="/purchase-returns" element={<PurchaseReturnsPage />} />} />
             <Route path="/stock"              element={<ProtectedRoute path="/stock"              element={<StockMovementsPage />} />} />
             <Route path="/waste"              element={<ProtectedRoute path="/waste"              element={<WasteTrackingPage />} />} />
             <Route path="/inventory"          element={<ProtectedRoute path="/inventory"          element={<InventoryCountPage />} />} />
@@ -256,6 +261,7 @@ function AppContent() {
             <Route path="/chart-of-accounts"  element={<ProtectedRoute path="/chart-of-accounts"  element={<ChartOfAccountsPage />} />} />
             <Route path="/banks"              element={<ProtectedRoute path="/banks"              element={<BanksPage />} />} />
             <Route path="/journal-entries"  element={<ProtectedRoute path="/journal-entries"  element={<JournalEntriesPage />} />} />
+            <Route path="/settlements"      element={<ProtectedRoute path="/settlements"      element={<SettlementsPage />} />} />
             <Route path="/financial-reports"  element={<ProtectedRoute path="/financial-reports"  element={<FinancialReportsPage />} />} />
             <Route path="/reports"            element={<ProtectedRoute path="/reports"            element={<ReportsHub />} />} />
             <Route path="/reports/:reportId"  element={<ProtectedRoute path="/reports"            element={<ReportsHub />} />} />
