@@ -399,6 +399,8 @@ model ExpenseCategory {
   id          Int       @id @default(autoincrement())
   name        String    @unique
   description String?
+  accountId   Int?
+  account     Account?  @relation(fields: [accountId], references: [id], onDelete: SetNull)
   createdAt   DateTime  @default(now())
   expenses    Expense[]
 }
@@ -430,6 +432,7 @@ model Account {
   createdAt     DateTime           @default(now())
   journalLines  JournalEntryLine[]
   bankAccounts  BankAccount[]      @relation("BankToChartAccount")
+  expenseCategories ExpenseCategory[]
 }
 
 // ─── BANKS & CASH ──────────────────────────────────────────────
