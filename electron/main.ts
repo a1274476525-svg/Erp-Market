@@ -303,6 +303,7 @@ function setupIpcHandlers() {
     const [group, action] = channel.split(':')
     if (group === 'pos' && action === 'voidOrder') return ['/sales', '/pos']
     if (group === 'pos' && action === 'createReturn') return ['/returns', '/pos']
+    if (group === 'invoices' && action === 'createReturn') return ['/purchase-returns', '/invoices']
     if (group === 'customers' && ['getPayments', 'receivePayment'].includes(action)) return ['/settlements', '/customers']
     if (group === 'suppliers' && ['getPayments', 'payInvoice'].includes(action)) return ['/settlements', '/suppliers']
     if (group === 'stock' && action === 'waste') return ['/waste', '/stock']
@@ -620,11 +621,15 @@ function setupIpcHandlers() {
     if (Number.isNaN(paymentDate.getTime())) throw new Error('تاريخ التحصيل غير صحيح')
 
     return prisma.$transaction(async (tx) => {
-      const order = await tx.posOrder.findUnique({ where: { id: data.orderId } })
+      const order = await tx.posOrder.findUnique({ where: { id: data.orderId }, include: { returns: true } })
       if (!order || order.status !== 'completed' || !order.customerId) throw new Error('الفاتورة الآجلة أو العميل غير موجود')
       if (order.paymentMethod !== 'credit') throw new Error('هذه الفاتورة ليست مسجلة على الحساب')
       const paid = await tx.customerPayment.aggregate({ where: { orderId: order.id }, _sum: { amount: true } })
-      const outstanding = Math.max(0, order.total - (paid._sum.amount ?? 0))
+      const returned = order.returns.reduce((sum, ret) => {
+        const ratio = order.subtotal > 0 ? ret.total / order.subtotal : 0
+        return sum + ret.total - Number(order.discountAmount ?? 0) * ratio + Number(order.taxAmount ?? 0) * ratio
+      }, 0)
+      const outstanding = Math.max(0, order.total - (paid._sum.amount ?? 0) - returned)
       if (amount > outstanding + 0.005) throw new Error(`مبلغ التحصيل أكبر من المتبقي: ${outstanding.toFixed(2)}`)
 
       await ensureStandardAccounts(tx)
@@ -697,7 +702,14 @@ function setupIpcHandlers() {
       const invoice = await tx.purchaseInvoice.findUnique({ where: { id: data.invoiceId } })
       if (!invoice || invoice.status !== 'confirmed' || !invoice.supplierId) throw new Error('فاتورة المورد غير موجودة أو غير مرتبطة بمورد')
       const paid = await tx.supplierPayment.aggregate({ where: { invoiceId: invoice.id }, _sum: { amount: true } })
-      const outstanding = Math.max(0, invoice.total - (paid._sum.amount ?? 0))
+      const returns = await tx.purchaseReturn.findMany({ where: { invoiceId: invoice.id }, select: { total: true } })
+      const returned = returns.reduce((sum, ret) => {
+        const taxShare = invoice.subtotal > 0
+          ? Math.round(invoice.taxAmount * ret.total / invoice.subtotal * 100) / 100
+          : 0
+        return sum + ret.total + taxShare
+      }, 0)
+      const outstanding = Math.max(0, invoice.total - (paid._sum.amount ?? 0) - returned)
       if (amount > outstanding + 0.005) throw new Error(`مبلغ السداد أكبر من المتبقي: ${outstanding.toFixed(2)}`)
 
       await ensureStandardAccounts(tx)
@@ -738,7 +750,7 @@ function setupIpcHandlers() {
   ipcHandle('invoices:getAll', () =>
     prisma.purchaseInvoice.findMany({
       where: { status: 'confirmed' },
-      include: { supplier: true, items: { include: { product: true } }, payments: true },
+      include: { supplier: true, items: { include: { product: true } }, payments: true, returns: { include: { items: true } } },
       orderBy: { invoiceDate: 'desc' },
     })
   )
@@ -818,8 +830,15 @@ function setupIpcHandlers() {
       const warehouse = await getDefaultWarehouse(tx)
       for (const item of inv.items) {
         if (!Number.isFinite(item.quantity) || item.quantity <= 0 || !Number.isFinite(item.unitPrice) || item.unitPrice < 0) throw new Error('بيانات صنف شراء غير صالحة')
+        const productCost = await tx.product.findUnique({ where: { id: item.productId }, select: { costPrice: true } })
+        if (!productCost) throw new Error('المنتج غير موجود')
+        const stockBefore = await tx.warehouseStock.aggregate({ where: { productId: item.productId }, _sum: { quantity: true } })
+        const quantityBefore = stockBefore._sum.quantity ?? 0
+        const weightedAverageCost = quantityBefore + item.quantity > 0
+          ? ((quantityBefore * productCost.costPrice) + (item.quantity * item.unitPrice)) / (quantityBefore + item.quantity)
+          : item.unitPrice
         await changeWarehouseStock(tx, warehouse.id, item.productId, item.quantity)
-        await tx.product.update({ where: { id: item.productId }, data: { costPrice: item.unitPrice } })
+        await tx.product.update({ where: { id: item.productId }, data: { costPrice: weightedAverageCost } })
         await tx.stockMovement.create({
           data: { productId: item.productId, quantity: item.quantity, type: 'purchase', referenceId: id },
         })
@@ -829,6 +848,108 @@ function setupIpcHandlers() {
     })
 
     return invoice
+  })
+
+  ipcHandle('invoices:createReturn', async (_, data: { invoiceId: number; items: { productId: number; quantity: number }[]; reason?: string }) => {
+    if (!Number.isInteger(data.invoiceId) || !Array.isArray(data.items) || data.items.length === 0) {
+      throw new Error('اختر فاتورة وحدد صنفًا واحدًا على الأقل للمرتجع')
+    }
+    return prisma.$transaction(async (tx) => {
+      const invoice = await tx.purchaseInvoice.findUnique({
+        where: { id: data.invoiceId },
+        include: { items: true, returns: { include: { items: true } } },
+      })
+      if (!invoice || invoice.status !== 'confirmed') throw new Error('فاتورة الشراء غير موجودة أو غير مؤكدة')
+      if (!Number.isFinite(invoice.subtotal) || invoice.subtotal <= 0) throw new Error('لا يمكن حساب ضريبة مرتجع لفاتورة مجموعها صفر')
+
+      const requested = new Map<number, number>()
+      for (const item of data.items) {
+        if (!Number.isInteger(item.productId) || !Number.isFinite(item.quantity) || item.quantity <= 0) {
+          throw new Error('كمية صنف المرتجع غير صالحة')
+        }
+        requested.set(item.productId, (requested.get(item.productId) ?? 0) + item.quantity)
+      }
+
+      const normalizedItems = [...requested.entries()].map(([productId, quantity]) => {
+        const purchased = invoice.items.filter(item => item.productId === productId)
+        if (purchased.length === 0) throw new Error('الصنف غير موجود في فاتورة الشراء')
+        const purchasedQty = purchased.reduce((sum, item) => sum + item.quantity, 0)
+        const returnedQty = invoice.returns.reduce((sum, ret) =>
+          sum + ret.items.filter(item => item.productId === productId).reduce((part, item) => part + item.quantity, 0), 0)
+        if (quantity > purchasedQty - returnedQty + 0.000001) {
+          throw new Error(`كمية المرتجع تتجاوز الكمية المشتراة للصنف ${purchased[0].productId}`)
+        }
+        const unitPrice = purchased.reduce((sum, item) => sum + item.unitPrice * item.quantity, 0) / purchasedQty
+        return { productId, productName: `صنف #${productId}`, quantity, unitPrice, total: quantity * unitPrice }
+      })
+
+      const warehouse = await getDefaultWarehouse(tx)
+      const itemsWithCost: { productId: number; productName: string; quantity: number; unitPrice: number; unitCost: number; total: number }[] = []
+      for (const item of normalizedItems) {
+        const product = await tx.product.findUnique({ where: { id: item.productId }, select: { name: true, costPrice: true } })
+        if (!product) throw new Error('المنتج غير موجود')
+        const stock = await tx.warehouseStock.findUnique({
+          where: { warehouseId_productId: { warehouseId: warehouse.id, productId: item.productId } },
+        })
+        if (!stock || stock.quantity < item.quantity) {
+          throw new Error(`المخزون غير كافٍ لإرجاع الصنف ${product.name} إلى المورد`)
+        }
+        itemsWithCost.push({ ...item, productName: product.name, unitCost: product.costPrice })
+      }
+
+      const subtotal = itemsWithCost.reduce((sum, item) => sum + item.total, 0)
+      const ratio = subtotal / invoice.subtotal
+      const taxShare = Math.round(invoice.taxAmount * ratio * 100) / 100
+      const supplierCredit = Math.round((subtotal + taxShare) * 100) / 100
+      const inventoryCost = Math.round(itemsWithCost.reduce((sum, item) => sum + item.quantity * item.unitCost, 0) * 100) / 100
+      const variance = Math.round((subtotal - inventoryCost) * 100) / 100
+      if (!Number.isFinite(supplierCredit) || supplierCredit <= 0 || !Number.isFinite(inventoryCost) || inventoryCost < 0) {
+        throw new Error('تعذر حساب قيمة مرتجع المورد')
+      }
+
+      const ret = await tx.purchaseReturn.create({
+        data: {
+          invoiceId: invoice.id,
+          reason: data.reason?.trim() || null,
+          total: subtotal,
+          items: { create: itemsWithCost },
+        },
+        include: { items: true },
+      })
+      for (const item of ret.items) {
+        await changeWarehouseStock(tx, warehouse.id, item.productId, -item.quantity)
+        await tx.stockMovement.create({
+          data: { productId: item.productId, quantity: -item.quantity, type: 'purchase_return', referenceId: ret.id, note: `مرتجع مورد ${invoice.invoiceNumber ?? invoice.id}` },
+        })
+      }
+
+      await ensureStandardAccounts(tx)
+      const [payableAcc, inventoryAcc, vatAcc, returnsAcc] = await Promise.all([
+        findAccByCode('2111', tx), findAccByCode('1131', tx),
+        findAccByCode('2121', tx), findAccByCode('512', tx),
+      ])
+      if (!payableAcc || !inventoryAcc || !returnsAcc) throw new Error('حساب الموردين أو المخزون أو مردودات المشتريات غير موجود')
+      const lines: { accountId: number; debit: number; credit: number; description?: string }[] = [
+        { accountId: payableAcc.id, debit: supplierCredit, credit: 0, description: 'إشعار دائن من المورد' },
+        { accountId: inventoryAcc.id, debit: 0, credit: inventoryCost, description: 'خروج مخزون مرتجع للمورد' },
+      ]
+      if (taxShare > 0) {
+        if (!vatAcc) throw new Error('حساب ضريبة القيمة المضافة غير موجود')
+        lines.push({ accountId: vatAcc.id, debit: 0, credit: taxShare, description: 'عكس ضريبة مدخلات' })
+      }
+      if (variance > 0) lines.push({ accountId: returnsAcc.id, debit: 0, credit: variance, description: 'مردودات مشتريات / فرق تكلفة' })
+      else if (variance < 0) lines.push({ accountId: returnsAcc.id, debit: Math.abs(variance), credit: 0, description: 'فرق تكلفة مردودات مشتريات' })
+      await autoJE({
+        date: new Date(ret.returnDate),
+        description: `مرتجع مشتريات - PR-${ret.id}`,
+        reference: invoice.invoiceNumber ?? `INV-${invoice.id}`,
+        source: 'purchase_return',
+        sourceId: ret.id,
+        lines,
+        db: tx,
+      })
+      return { ...ret, taxAmount: taxShare, supplierCredit }
+    })
   })
 
   // ─── PURCHASE REQUESTS ─────────────────────────────────────────
@@ -957,7 +1078,7 @@ function setupIpcHandlers() {
 
   ipcHandle('pos:getOrders', (_, limit = 100) =>
     prisma.posOrder.findMany({
-      include: { items: { include: { product: true } }, customer: true, payments: true },
+      include: { items: { include: { product: true } }, customer: true, payments: true, returns: { select: { total: true } } },
       orderBy: { createdAt: 'desc' },
       take: limit,
     })
@@ -2836,22 +2957,36 @@ function setupIpcHandlers() {
     if (start && end && start >= end) throw new Error('تاريخ البداية يجب أن يسبق تاريخ النهاية')
     const invoiceWhere: any = { supplierId: id, status: 'confirmed' }
     const paymentWhere: any = { supplierId: id }
-    if (start) { invoiceWhere.invoiceDate = { gte: start, ...(end ? { lt: end } : {}) }; paymentWhere.date = { gte: start, ...(end ? { lt: end } : {}) } }
-    else if (end) { invoiceWhere.invoiceDate = { lt: end }; paymentWhere.date = { lt: end } }
+    const returnWhere: any = { invoice: { supplierId: id, status: 'confirmed' } }
+    if (start) {
+      invoiceWhere.invoiceDate = { gte: start, ...(end ? { lt: end } : {}) }
+      paymentWhere.date = { gte: start, ...(end ? { lt: end } : {}) }
+      returnWhere.returnDate = { gte: start, ...(end ? { lt: end } : {}) }
+    } else if (end) {
+      invoiceWhere.invoiceDate = { lt: end }
+      paymentWhere.date = { lt: end }
+      returnWhere.returnDate = { lt: end }
+    }
     const openingWhereInvoices: any = { supplierId: id, status: 'confirmed', ...(start ? { invoiceDate: { lt: start } } : { id: -1 }) }
     const openingWherePayments: any = { supplierId: id, ...(start ? { date: { lt: start } } : { id: -1 }) }
-    const [invoices, payments, supplier, openingInvoices, openingPayments] = await Promise.all([
+    const openingWhereReturns: any = { invoice: { supplierId: id, status: 'confirmed' }, ...(start ? { returnDate: { lt: start } } : { id: -1 }) }
+    const [invoices, payments, returns, supplier, openingInvoices, openingPayments, openingReturns] = await Promise.all([
       prisma.purchaseInvoice.findMany({ where: invoiceWhere, orderBy: { invoiceDate: 'asc' } }),
       prisma.supplierPayment.findMany({ where: paymentWhere, orderBy: { date: 'asc' }, include: { invoice: true } }),
+      prisma.purchaseReturn.findMany({ where: returnWhere, orderBy: { returnDate: 'asc' }, include: { invoice: true } }),
       prisma.supplier.findUnique({ where: { id } }),
       prisma.purchaseInvoice.aggregate({ where: openingWhereInvoices, _sum: { total: true } }),
       prisma.supplierPayment.aggregate({ where: openingWherePayments, _sum: { amount: true } }),
+      prisma.purchaseReturn.findMany({ where: openingWhereReturns, include: { invoice: true } }),
     ])
     if (!supplier) throw new Error('المورد غير موجود')
-    const openingBalance = (openingInvoices._sum.total ?? 0) - (openingPayments._sum.amount ?? 0)
+    const returnValue = (ret: any) => ret.total + (ret.invoice.subtotal > 0 ? ret.invoice.taxAmount * ret.total / ret.invoice.subtotal : 0)
+    const openingReturnTotal = openingReturns.reduce((sum: number, ret: any) => sum + returnValue(ret), 0)
+    const openingBalance = (openingInvoices._sum.total ?? 0) - (openingPayments._sum.amount ?? 0) - openingReturnTotal
     const events = [
       ...invoices.map(i => ({ date: i.invoiceDate, description: `فاتورة مشتريات ${i.invoiceNumber ?? `INV-${i.id}`}`, amount: i.total, debit: 0, credit: i.total, kind: 'purchase' })),
       ...payments.map(p => ({ date: p.date, description: `سداد على ${p.invoice.invoiceNumber ?? `INV-${p.invoice.id}`}${p.reference ? ` - ${p.reference}` : ''}`, amount: -p.amount, debit: p.amount, credit: 0, kind: 'payment' })),
+      ...returns.map(ret => { const value = returnValue(ret); return { date: ret.returnDate, description: `إشعار دائن / مرتجع مشتريات ${ret.id}`, amount: -value, debit: value, credit: 0, kind: 'return' } }),
     ].sort((x, y) => new Date(x.date).getTime() - new Date(y.date).getTime())
     let balance = openingBalance
     const rows = events.map(event => {
@@ -2860,7 +2995,8 @@ function setupIpcHandlers() {
     })
     const totalInvoices = invoices.reduce((sum, i) => sum + i.total, 0)
     const totalPayments = payments.reduce((sum, p) => sum + p.amount, 0)
-    return { supplier, rows, openingBalance, total: balance, balance, totalInvoices, totalPayments, count: rows.length }
+    const totalReturns = returns.reduce((sum, ret) => sum + returnValue(ret), 0)
+    return { supplier, rows, openingBalance, total: balance, balance, totalInvoices, totalPayments, totalReturns, count: rows.length }
   })
 
   ipcHandle('reports:vatDetails', async (_, { from, to }: any = {}) => {
@@ -2952,38 +3088,82 @@ function setupIpcHandlers() {
     }
   })
 
-  ipcHandle('reports:arAging', async (_, { asOf }: any = {}) => {
+  ipcHandle('reports:arAging', async (_, { asOf }: { asOf?: string } = {}) => {
     const cutoff = asOf ? new Date(asOf) : new Date()
+    if (Number.isNaN(cutoff.getTime())) throw new Error('تاريخ تقرير أعمار الديون غير صحيح')
+    cutoff.setUTCHours(23, 59, 59, 999)
     const customers = await prisma.customer.findMany({
-      include: { orders: { where: { status: 'completed' }, orderBy: { createdAt: 'desc' } } },
+      include: {
+        orders: {
+          where: { status: 'completed', paymentMethod: 'credit' },
+          include: { payments: true, returns: true },
+          orderBy: { createdAt: 'desc' },
+        },
+      },
+      orderBy: { name: 'asc' },
     })
-    return customers.filter(c => c.orders.length > 0).map(c => {
-      const last = c.orders[0]
-      const days = Math.floor((cutoff.getTime() - new Date(last.createdAt).getTime()) / 86400000)
-      const total = c.orders.reduce((s, o) => s + o.total, 0)
-      return { id: c.id, name: c.name, phone: c.phone, total, lastDate: last.createdAt, days, count: c.orders.length }
-    }).sort((a, b) => b.total - a.total)
+    const result = customers.map(customer => {
+      const rows = customer.orders.map(order => {
+        const paid = order.payments.reduce((sum, payment) => sum + payment.amount, 0)
+        const returned = order.returns.reduce((sum, ret) => {
+          const ratio = order.subtotal > 0 ? ret.total / order.subtotal : 0
+          return sum + ret.total - Number(order.discountAmount ?? 0) * ratio + Number(order.taxAmount ?? 0) * ratio
+        }, 0)
+        const due = Math.max(0, order.total - paid - returned)
+        const days = Math.max(0, Math.floor((cutoff.getTime() - new Date(order.createdAt).getTime()) / 86400000))
+        return { id: order.id, orderNumber: order.orderNumber, date: order.createdAt, total: order.total, paid, returned, due, days }
+      }).filter(row => row.due > 0.005)
+      const total = rows.reduce((sum, row) => sum + row.due, 0)
+      const bucket = (days: number) => days <= 30 ? 'c0' : days <= 60 ? 'c30' : days <= 90 ? 'c60' : 'c90'
+      const aging = { c0: 0, c30: 0, c60: 0, c90: 0 }
+      for (const row of rows) aging[bucket(row.days) as keyof typeof aging] += row.due
+      const oldest = rows.reduce<Date | null>((value, row) => !value || new Date(row.date) < value ? new Date(row.date) : value, null)
+      const latest = rows.reduce<Date | null>((value, row) => !value || new Date(row.date) > value ? new Date(row.date) : value, null)
+      const oldestDueDate = oldest
+      const lastDate = latest
+      const days = latest ? Math.max(0, Math.floor((cutoff.getTime() - latest.getTime()) / 86400000)) : 0
+      return { id: customer.id, name: customer.name, phone: customer.phone, rows, total, ...aging, lastDate, oldestDueDate, days, count: rows.length }
+    }).filter(customer => customer.total > 0.005)
+    return result.sort((a, b) => b.total - a.total)
   })
 
-  ipcHandle('reports:apAging', async (_, { asOf }: any = {}) => {
+  ipcHandle('reports:apAging', async (_, { asOf }: { asOf?: string } = {}) => {
     const cutoff = asOf ? new Date(asOf) : new Date()
+    if (Number.isNaN(cutoff.getTime())) throw new Error('تاريخ تقرير أعمار الديون غير صحيح')
+    cutoff.setUTCHours(23, 59, 59, 999)
     const invoices = await prisma.purchaseInvoice.findMany({
-      where: { status: 'confirmed' }, include: { supplier: true }, orderBy: { invoiceDate: 'asc' },
+      where: { status: 'confirmed' },
+      include: { supplier: true, payments: true, returns: true },
+      orderBy: { invoiceDate: 'asc' },
     })
     const map = new Map<number, any>()
-    for (const inv of invoices) {
-      const sid = inv.supplierId ?? 0
-      if (!map.has(sid)) map.set(sid, { supplier: inv.supplier, rows: [], total: 0, c0: 0, c30: 0, c60: 0, c90: 0 })
-      const entry = map.get(sid)!
-      const days = Math.floor((cutoff.getTime() - new Date(inv.invoiceDate).getTime()) / 86400000)
-      entry.rows.push({ ...inv, days })
-      entry.total += inv.total
-      if      (days <= 30) entry.c0  += inv.total
-      else if (days <= 60) entry.c30 += inv.total
-      else if (days <= 90) entry.c60 += inv.total
-      else                 entry.c90 += inv.total
+    for (const invoice of invoices) {
+      const supplierId = invoice.supplierId ?? 0
+      if (!map.has(supplierId)) {
+        map.set(supplierId, {
+          supplier: invoice.supplier, rows: [], total: 0, c0: 0, c30: 0, c60: 0, c90: 0,
+        })
+      }
+      const entry = map.get(supplierId)!
+      const paid = invoice.payments.reduce((sum, payment) => sum + payment.amount, 0)
+      const returned = invoice.returns.reduce((sum, ret) => {
+        const taxShare = invoice.subtotal > 0
+          ? Math.round(invoice.taxAmount * ret.total / invoice.subtotal * 100) / 100
+          : 0
+        return sum + ret.total + taxShare
+      }, 0)
+      const due = Math.max(0, invoice.total - paid - returned)
+      if (due <= 0.005) continue
+      const days = Math.max(0, Math.floor((cutoff.getTime() - new Date(invoice.invoiceDate).getTime()) / 86400000))
+      const row = { ...invoice, paid, returned, due, days }
+      entry.rows.push(row)
+      entry.total += due
+      if (days <= 30) entry.c0 += due
+      else if (days <= 60) entry.c30 += due
+      else if (days <= 90) entry.c60 += due
+      else entry.c90 += due
     }
-    return Array.from(map.values()).sort((a, b) => b.total - a.total)
+    return Array.from(map.values()).filter(entry => entry.total > 0.005).sort((a, b) => b.total - a.total)
   })
 
   ipcHandle('reports:executiveSummary', async (_, { from, to }: any = {}) => {
@@ -3171,12 +3351,14 @@ function setupIpcHandlers() {
 
       if (removePurchases) {
         await tx.supplierPayment.deleteMany({})
-        await tx.journalEntry.deleteMany({ where: { source: 'supplier_payment' } })
+        await tx.journalEntry.deleteMany({ where: { source: { in: ['supplier_payment', 'purchase_return'] } } })
+        await tx.purchaseReturnItem.deleteMany({})
+        await tx.purchaseReturn.deleteMany({})
         await tx.purchaseItem.deleteMany({})
         await tx.purchaseInvoice.deleteMany({})
         await tx.purchaseRequestItem.deleteMany({})
         await tx.purchaseRequest.deleteMany({})
-        await tx.stockMovement.deleteMany({ where: { type: 'purchase' } })
+        await tx.stockMovement.deleteMany({ where: { type: { in: ['purchase', 'purchase_return'] } } })
         await tx.journalEntry.deleteMany({ where: { source: 'purchase' } })
       }
 
