@@ -326,38 +326,61 @@ function setupIpcHandlers() {
   }
   const ipcHandle = (channel: string, handler: (...args: any[]) => any) => {
     ipcMain.handle(channel, async (event, ...args) => {
-      if (channel === 'auth:logout') {
-        authenticatedSessions.delete(event.sender.id)
-        return handler(event, ...args)
-      }
-      if (publicChannels.has(channel)) return handler(event, ...args)
-      if (channel === 'auth:create' && await prisma.user.count() === 0) {
-        return handler(event, ...args)
+      const requestStarted = performance.now()
+      let handlerMs = 0
+      const invokeHandler = async () => {
+        const handlerStarted = performance.now()
+        try {
+          return await handler(event, ...args)
+        } finally {
+          handlerMs = performance.now() - handlerStarted
+        }
       }
 
-      const userId = authenticatedSessions.get(event.sender.id)
-      if (!userId) throw new Error('انتهت جلسة الدخول. سجل الدخول مرة أخرى')
-      const user = await prisma.user.findUnique({
-        where: { id: userId },
-        select: { role: true, isActive: true },
-      })
-      if (!user?.isActive) {
-        authenticatedSessions.delete(event.sender.id)
-        throw new Error('الحساب غير نشط. سجل الدخول بحساب آخر')
-      }
-      const role = await resolveRole(user.role)
-      if (!role) throw new Error('دور المستخدم غير موجود')
+      try {
+        if (channel === 'auth:logout') {
+          authenticatedSessions.delete(event.sender.id)
+          return await invokeHandler()
+        }
+        if (publicChannels.has(channel)) return await invokeHandler()
+        if (channel === 'auth:create' && await prisma.user.count() === 0) {
+          return await invokeHandler()
+        }
 
-      const action = channel.split(':')[1] ?? ''
-      if (mutatingActions.has(action) && !role.fullAccess && channel !== 'activity:log') {
-        const allowedPaths = permissionPaths(channel)
-        const hasPermission = allowedPaths.length > 0 && allowedPaths.some(path =>
-          role.permissions.some(permission => path === permission || path.startsWith(permission + '/'))
-        )
-        // Fail closed: an unmapped mutation must never become implicitly allowed.
-        if (!hasPermission) throw new Error('ليس لديك صلاحية لتنفيذ هذه العملية')
+        const userId = authenticatedSessions.get(event.sender.id)
+        if (!userId) throw new Error('انتهت جلسة الدخول. سجل الدخول مرة أخرى')
+        const user = await prisma.user.findUnique({
+          where: { id: userId },
+          select: { role: true, isActive: true },
+        })
+        if (!user?.isActive) {
+          authenticatedSessions.delete(event.sender.id)
+          throw new Error('الحساب غير نشط. سجل الدخول بحساب آخر')
+        }
+        const role = await resolveRole(user.role)
+        if (!role) throw new Error('دور المستخدم غير موجود')
+
+        const action = channel.split(':')[1] ?? ''
+        if (mutatingActions.has(action) && !role.fullAccess && channel !== 'activity:log') {
+          const allowedPaths = permissionPaths(channel)
+          const hasPermission = allowedPaths.length > 0 && allowedPaths.some(path =>
+            role.permissions.some(permission => path === permission || path.startsWith(permission + '/'))
+          )
+          // Fail closed: an unmapped mutation must never become implicitly allowed.
+          if (!hasPermission) throw new Error('ليس لديك صلاحية لتنفيذ هذه العملية')
+        }
+        return await invokeHandler()
+      } finally {
+        const totalMs = performance.now() - requestStarted
+        // Development-only diagnostics: log timings, never request payloads or SQL.
+        if (isDev && totalMs >= 120) {
+          console.warn('[SlowIPC]', channel, {
+            totalMs: Math.round(totalMs),
+            handlerMs: Math.round(handlerMs),
+            accessCheckMs: Math.max(0, Math.round(totalMs - handlerMs)),
+          })
+        }
       }
-      return handler(event, ...args)
     })
   }
 
