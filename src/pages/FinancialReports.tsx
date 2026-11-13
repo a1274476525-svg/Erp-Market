@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { TrendingUp, TrendingDown, Scale, FileText, Receipt, RefreshCw, Download } from 'lucide-react'
+import { TrendingUp, TrendingDown, Scale, FileText, Receipt, RefreshCw, Download, BookOpen } from 'lucide-react'
 import * as XLSX from 'xlsx'
 import { useSettings } from '../contexts/SettingsContext'
 
@@ -14,18 +14,34 @@ interface FinancialData {
   vat: { collected: number; paid: number; net: number }
   inventory: { value: number }
   banks: { cash: number; bank: number; accounts: any[] }
-  trialBalance: { code: string; name: string; type: string; debit: number; credit: number }[]
+  trialBalance: { code: string; name: string; type: string; openingBalance: number; debit: number; credit: number; closingBalance: number }[]
+  balanceSheet: {
+    asOf: string
+    assets: { id: number; code: string; name: string; balance: number }[]
+    liabilities: { id: number; code: string; name: string; balance: number }[]
+    equity: { id: number; code: string; name: string; balance: number }[]
+    currentEarnings: number
+    assetsTotal: number
+    liabilitiesTotal: number
+    equityTotal: number
+    liabilitiesAndEquity: number
+    difference: number
+    isBalanced: boolean
+    receivables: number
+    payables: number
+  }
   ordersCount: number
   invoicesCount: number
 }
 
-type ReportTab = 'income' | 'balance' | 'trial' | 'vat'
+type ReportTab = 'income' | 'balance' | 'trial' | 'vat' | 'ledger'
 
 const TAB_LABELS: Record<ReportTab, string> = {
   income:  'قائمة الدخل',
   balance: 'الميزانية العمومية',
   trial:   'ميزان المراجعة',
   vat:     'تقرير الضرائب',
+  ledger:  'دفتر الأستاذ',
 }
 
 function StatCard({ label, value, currency, sub, color = 'slate' }: {
@@ -64,6 +80,9 @@ export default function FinancialReports() {
   const [data, setData]     = useState<FinancialData | null>(null)
   const [loading, setLoading] = useState(false)
   const [tab, setTab]       = useState<ReportTab>('income')
+  const [ledgerAccountId, setLedgerAccountId] = useState<number | ''>('')
+  const [ledgerData, setLedgerData] = useState<any>(null)
+  const [ledgerLoading, setLedgerLoading] = useState(false)
   const { settings }        = useSettings()
   const cur                 = settings.currency
 
@@ -77,6 +96,23 @@ export default function FinancialReports() {
   }, [from, to])
 
   useEffect(() => { load() }, [load])
+
+  useEffect(() => {
+    if (tab !== 'ledger') return
+    let active = true
+    setLedgerLoading(true)
+    window.api.reports.generalLedger({
+      accountId: ledgerAccountId === '' ? undefined : ledgerAccountId,
+      from, to,
+    }).then(result => {
+      if (active) setLedgerData(result)
+    }).catch((error: any) => {
+      if (active) alert(error?.message || 'تعذر تحميل دفتر الأستاذ')
+    }).finally(() => {
+      if (active) setLedgerLoading(false)
+    })
+    return () => { active = false }
+  }, [tab, ledgerAccountId, from, to])
 
   function exportCurrentFinancialReport() {
     if (!data) return
@@ -97,18 +133,34 @@ export default function FinancialReports() {
       rows.push(['إجمالي المصروفات', -data.expenses.total])
       rows.push(['صافي الربح / الخسارة', data.netProfit])
     } else if (tab === 'balance') {
-      rows.push(['البند', 'القيمة'])
-      rows.push(['المخزون', data.inventory.value])
-      rows.push(['الصناديق والعهد', data.banks.cash])
-      rows.push(['البنوك', data.banks.bank])
-      rows.push(['إجمالي الأصول المعروضة', data.inventory.value + data.banks.cash + data.banks.bank])
-      rows.push(['ضريبة القيمة المضافة المستحقة', Math.max(data.vat.net, 0)])
-      rows.push(['صافي ربح / خسارة الفترة', data.netProfit])
-      rows.push(['إجمالي الخصوم وحقوق الملكية المعروضة', Math.max(data.vat.net, 0) + data.netProfit])
+      rows.push(['الأصول', 'القيمة'])
+      data.balanceSheet.assets.forEach(account => rows.push([account.code + ' — ' + account.name, account.balance]))
+      rows.push(['إجمالي الأصول', data.balanceSheet.assetsTotal])
+      rows.push([])
+      rows.push(['الخصوم', 'القيمة'])
+      data.balanceSheet.liabilities.forEach(account => rows.push([account.code + ' — ' + account.name, account.balance]))
+      rows.push(['إجمالي الخصوم', data.balanceSheet.liabilitiesTotal])
+      rows.push([])
+      rows.push(['حقوق الملكية', 'القيمة'])
+      data.balanceSheet.equity.forEach(account => rows.push([account.code + ' — ' + account.name, account.balance]))
+      rows.push(['الأرباح المتراكمة غير المقفلة', data.balanceSheet.currentEarnings])
+      rows.push(['إجمالي حقوق الملكية', data.balanceSheet.equityTotal])
+      rows.push(['إجمالي الخصوم وحقوق الملكية', data.balanceSheet.liabilitiesAndEquity])
+      rows.push(['فرق الموازنة', data.balanceSheet.difference])
     } else if (tab === 'trial') {
-      rows.push(['كود الحساب', 'الحساب', 'النوع', 'مدين', 'دائن'])
-      data.trialBalance.forEach(row => rows.push([row.code, row.name, row.type, row.debit, row.credit]))
-      rows.push(['', 'الإجمالي', '', data.trialBalance.reduce((sum, row) => sum + row.debit, 0), data.trialBalance.reduce((sum, row) => sum + row.credit, 0)])
+      rows.push(['كود الحساب', 'الحساب', 'النوع', 'رصيد أول المدة', 'مدين الفترة', 'دائن الفترة', 'رصيد آخر المدة'])
+      data.trialBalance.forEach(row => rows.push([row.code, row.name, row.type, row.openingBalance, row.debit, row.credit, row.closingBalance]))
+      rows.push(['', 'الإجمالي', '', '', data.trialBalance.reduce((sum, row) => sum + row.debit, 0), data.trialBalance.reduce((sum, row) => sum + row.credit, 0), ''])
+    } else if (tab === 'ledger') {
+      if (!ledgerData?.selectedAccount) return
+      rows.push(['الحساب', ledgerData.selectedAccount.code + ' — ' + ledgerData.selectedAccount.name])
+      rows.push(['رصيد أول المدة', ledgerData.openingBalance])
+      rows.push(['التاريخ', 'رقم القيد', 'البيان', 'مدين', 'دائن', 'الرصيد'])
+      ledgerData.rows.forEach((row: any) => rows.push([
+        new Date(row.date).toLocaleDateString('ar-EG'), row.entryNumber, row.description,
+        row.debit, row.credit, row.balance,
+      ]))
+      rows.push(['', '', 'إجماليات الحركة', ledgerData.totalDebit, ledgerData.totalCredit, ledgerData.closingBalance])
     } else {
       rows.push(['البند', 'القيمة'])
       rows.push(['وعاء مبيعات', data.revenue.total])
@@ -172,10 +224,65 @@ export default function FinancialReports() {
                 {t === 'balance' && <Scale size={15} />}
                 {t === 'trial'   && <FileText size={15} />}
                 {t === 'vat'     && <Receipt size={15} />}
+                {t === 'ledger'  && <BookOpen size={15} />}
                 {TAB_LABELS[t]}
               </button>
             ))}
           </div>
+
+          {tab === 'ledger' && (
+            <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+              <div className="p-4 border-b flex flex-wrap items-center gap-3 justify-between">
+                <div>
+                  <h2 className="font-semibold text-slate-800">دفتر الأستاذ العام</h2>
+                  <p className="text-xs text-slate-500 mt-1">حركة الحساب التفصيلي والأرصدة الجارية من القيود المرحلة فقط</p>
+                </div>
+                <select value={ledgerAccountId} onChange={e => setLedgerAccountId(e.target.value ? Number(e.target.value) : '')}
+                  className="min-w-64 border rounded-lg px-3 py-2 text-sm bg-white">
+                  <option value="">اختر حسابًا تفصيليًا</option>
+                  {(ledgerData?.accounts ?? []).map((account: any) => (
+                    <option key={account.id} value={account.id}>{account.code} — {account.name}</option>
+                  ))}
+                </select>
+              </div>
+              {ledgerLoading ? <div className="p-8 text-center text-slate-400">جارٍ تحميل دفتر الأستاذ...</div> :
+                !ledgerData?.selectedAccount ? <div className="p-8 text-center text-slate-400">اختر حسابًا لعرض حركته خلال الفترة المحددة</div> : (
+                  <>
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3 p-4 bg-slate-50">
+                      <div><div className="text-xs text-slate-500">رصيد أول المدة</div><b>{ledgerData.openingBalance.toFixed(2)} {cur}</b></div>
+                      <div><div className="text-xs text-slate-500">إجمالي المدين</div><b className="text-blue-700">{ledgerData.totalDebit.toFixed(2)} {cur}</b></div>
+                      <div><div className="text-xs text-slate-500">إجمالي الدائن</div><b className="text-emerald-700">{ledgerData.totalCredit.toFixed(2)} {cur}</b></div>
+                      <div><div className="text-xs text-slate-500">رصيد آخر المدة</div><b>{ledgerData.closingBalance.toFixed(2)} {cur}</b></div>
+                    </div>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-sm min-w-[760px]">
+                        <thead className="bg-slate-50 text-slate-500">
+                          <tr>
+                            <th className="p-3 text-right">التاريخ</th><th className="p-3 text-right">رقم القيد</th>
+                            <th className="p-3 text-right">البيان</th><th className="p-3 text-center">مدين</th>
+                            <th className="p-3 text-center">دائن</th><th className="p-3 text-center">الرصيد الجاري</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y">
+                          <tr className="bg-amber-50"><td className="p-3" colSpan={3}>رصيد أول المدة</td><td className="p-3 text-center">—</td><td className="p-3 text-center">—</td><td className="p-3 text-center font-semibold">{ledgerData.openingBalance.toFixed(2)}</td></tr>
+                          {ledgerData.rows.map((row: any) => (
+                            <tr key={row.id} className="hover:bg-slate-50">
+                              <td className="p-3">{new Date(row.date).toLocaleDateString('ar-EG')}</td>
+                              <td className="p-3 font-mono text-xs">{row.entryNumber}</td>
+                              <td className="p-3">{row.description}</td>
+                              <td className="p-3 text-center">{row.debit ? row.debit.toFixed(2) : '—'}</td>
+                              <td className="p-3 text-center">{row.credit ? row.credit.toFixed(2) : '—'}</td>
+                              <td className="p-3 text-center font-semibold">{row.balance.toFixed(2)}</td>
+                            </tr>
+                          ))}
+                          {ledgerData.rows.length === 0 && <tr><td colSpan={6} className="p-8 text-center text-slate-400">لا توجد حركة مرحلة لهذا الحساب في الفترة المحددة</td></tr>}
+                        </tbody>
+                      </table>
+                    </div>
+                  </>
+                )}
+            </div>
+          )}
 
           {/* Income Statement */}
           {tab === 'income' && (
@@ -196,28 +303,31 @@ export default function FinancialReports() {
 
           {/* Balance Sheet */}
           {tab === 'balance' && (
-            <div className="grid grid-cols-2 gap-4">
-              {/* Assets */}
-              <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-                <div className="px-4 py-3 bg-blue-700 text-white text-sm font-semibold">الأصول</div>
-                <Row label="المخزون (قيمة دفترية)" value={data.inventory.value} currency={cur} indent={1} />
-                <Row label="الصناديق النقدية والعهد" value={data.banks.cash} currency={cur} indent={1} />
-                <Row label="أرصدة البنوك" value={data.banks.bank} currency={cur} indent={1} />
-                <Row label="إجمالي الأصول" value={data.inventory.value + data.banks.cash + data.banks.bank} currency={cur} bold color="blue" />
+            <div className="space-y-4">
+              <div className={`rounded-xl border p-3 text-sm flex items-center justify-between ${data.balanceSheet.isBalanced ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : 'bg-amber-50 border-amber-200 text-amber-800'}`}>
+                <span>{data.balanceSheet.isBalanced ? 'الميزانية متوازنة حسب دفتر الأستاذ المرحّل' : 'يوجد فرق بين إجمالي الأصول والخصوم وحقوق الملكية'}</span>
+                <span className="font-bold">حتى {data.balanceSheet.asOf} · الفرق {data.balanceSheet.difference.toFixed(2)} {cur}</span>
               </div>
-              {/* Liabilities + Equity */}
-              <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-                <div className="px-4 py-3 bg-red-700 text-white text-sm font-semibold">الخصوم وحقوق الملكية</div>
-                <div className="px-4 py-2 text-xs font-semibold text-slate-500 bg-slate-50">الخصوم</div>
-                <Row label="ضريبة القيمة المضافة المستحقة" value={data.vat.net > 0 ? data.vat.net : 0} currency={cur} indent={1} />
-                <div className="px-4 py-2 text-xs font-semibold text-slate-500 bg-slate-50">حقوق الملكية</div>
-                <Row label="صافي الربح / الخسارة" value={data.netProfit} currency={cur} indent={1} color={data.netProfit >= 0 ? 'emerald' : 'red'} />
-                <Row label="إجمالي الخصوم وحقوق الملكية"
-                  value={(data.vat.net > 0 ? data.vat.net : 0) + data.netProfit}
-                  currency={cur} bold color="red" />
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+                  <div className="px-4 py-3 bg-blue-700 text-white text-sm font-semibold">الأصول</div>
+                  {data.balanceSheet.assets.map(account => <Row key={account.id} label={`${account.code} — ${account.name}`} value={account.balance} currency={cur} indent={1} />)}
+                  <Row label="إجمالي الأصول" value={data.balanceSheet.assetsTotal} currency={cur} bold color="blue" />
+                </div>
+                <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+                  <div className="px-4 py-3 bg-red-700 text-white text-sm font-semibold">الخصوم وحقوق الملكية</div>
+                  <div className="px-4 py-2 text-xs font-semibold text-slate-500 bg-slate-50">الخصوم</div>
+                  {data.balanceSheet.liabilities.map(account => <Row key={account.id} label={`${account.code} — ${account.name}`} value={account.balance} currency={cur} indent={1} />)}
+                  <Row label="إجمالي الخصوم" value={data.balanceSheet.liabilitiesTotal} currency={cur} bold />
+                  <div className="px-4 py-2 text-xs font-semibold text-slate-500 bg-slate-50">حقوق الملكية</div>
+                  {data.balanceSheet.equity.map(account => <Row key={account.id} label={`${account.code} — ${account.name}`} value={account.balance} currency={cur} indent={1} />)}
+                  <Row label="الأرباح المتراكمة غير المقفلة" value={data.balanceSheet.currentEarnings} currency={cur} indent={1} color={data.balanceSheet.currentEarnings >= 0 ? 'emerald' : 'red'} />
+                  <Row label="إجمالي حقوق الملكية" value={data.balanceSheet.equityTotal} currency={cur} bold />
+                  <Row label="إجمالي الخصوم وحقوق الملكية" value={data.balanceSheet.liabilitiesAndEquity} currency={cur} bold color="red" />
+                </div>
               </div>
-              <div className="col-span-2 bg-amber-50 border border-amber-200 rounded-xl p-4 text-sm text-amber-700">
-                <strong>ملاحظة:</strong> هذه الميزانية تقديرية ومبسطة بناءً على بيانات المبيعات والمشتريات والمصاريف المسجلة. لميزانية كاملة يجب تسجيل كافة الأصول والخصوم في دليل الحسابات.
+              <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs text-slate-600">
+                تُحسب الميزانية من أرصدة القيود المرحّلة حتى تاريخ التقرير. يلزم تسجيل الأرصدة الافتتاحية وجميع الأصول والالتزامات خارج دورة البيع والشراء حتى تعكس المركز المالي بالكامل.
               </div>
             </div>
           )}
@@ -225,15 +335,17 @@ export default function FinancialReports() {
           {/* Trial Balance */}
           {tab === 'trial' && (
             <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-              <div className="px-4 py-3 bg-slate-800 text-white text-sm font-semibold">ميزان المراجعة (مبسط)</div>
+              <div className="px-4 py-3 bg-slate-800 text-white text-sm font-semibold">ميزان المراجعة</div>
               <table className="w-full text-sm">
                 <thead className="bg-slate-50 text-slate-500 text-xs uppercase">
                   <tr>
                     <th className="px-4 py-3 text-right">كود</th>
                     <th className="px-4 py-3 text-right">الحساب</th>
                     <th className="px-4 py-3 text-center">النوع</th>
-                    <th className="px-4 py-3 text-center">مدين</th>
-                    <th className="px-4 py-3 text-center">دائن</th>
+                    <th className="px-4 py-3 text-center">رصيد أول المدة</th>
+                    <th className="px-4 py-3 text-center">مدين الفترة</th>
+                    <th className="px-4 py-3 text-center">دائن الفترة</th>
+                    <th className="px-4 py-3 text-center">رصيد آخر المدة</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
@@ -242,25 +354,28 @@ export default function FinancialReports() {
                       <td className="px-4 py-2.5 font-mono text-xs text-slate-500">{row.code}</td>
                       <td className="px-4 py-2.5 text-slate-800">{row.name}</td>
                       <td className="px-4 py-2.5 text-center text-xs text-slate-500">{row.type}</td>
+                      <td className="px-4 py-2.5 text-center font-medium">{row.openingBalance.toFixed(2)}</td>
                       <td className="px-4 py-2.5 text-center font-medium">{row.debit > 0 ? row.debit.toFixed(2) : '—'}</td>
                       <td className="px-4 py-2.5 text-center font-medium">{row.credit > 0 ? row.credit.toFixed(2) : '—'}</td>
+                      <td className="px-4 py-2.5 text-center font-semibold">{row.closingBalance.toFixed(2)}</td>
                     </tr>
                   ))}
                 </tbody>
                 <tfoot className="bg-slate-100 font-bold">
                   <tr>
-                    <td colSpan={3} className="px-4 py-3 text-right">الإجماليات</td>
+                    <td colSpan={4} className="px-4 py-3 text-right">إجماليات الحركة</td>
                     <td className="px-4 py-3 text-center text-blue-700">
                       {data.trialBalance.reduce((s, r) => s + r.debit, 0).toFixed(2)}
                     </td>
                     <td className="px-4 py-3 text-center text-emerald-700">
                       {data.trialBalance.reduce((s, r) => s + r.credit, 0).toFixed(2)}
                     </td>
+                    <td className="px-4 py-3 text-center">—</td>
                   </tr>
                 </tfoot>
               </table>
               <div className="p-4 bg-amber-50 border-t border-amber-200 text-xs text-amber-700">
-                هذا ميزان مراجعة مبسط يعتمد على عمليات المبيعات والمشتريات والمصاريف. لميزان مراجعة دقيق يجب استخدام نظام محاسبة قيد مزدوج كامل.
+                يعرض التقرير أرصدة أول المدة وحركة الفترة وأرصدة آخر المدة من القيود المحاسبية المرحّلة فقط.
               </div>
             </div>
           )}
