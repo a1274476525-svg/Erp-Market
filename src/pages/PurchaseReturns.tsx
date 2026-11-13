@@ -16,7 +16,7 @@ export default function PurchaseReturnsPage() {
   async function load() {
     setLoading(true)
     try {
-      setInvoices(await window.api.invoices.getAll())
+      setInvoices((await window.api.invoices.getAll()).filter((invoice: any) => Boolean(invoice.supplierId)))
     } catch (e: any) {
       setError(e?.message || 'تعذر تحميل فواتير الشراء')
     } finally {
