@@ -1948,7 +1948,15 @@ function setupIpcHandlers() {
 
   // ─── EXPENSES ──────────────────────────────────────────────────
   ipcHandle('expenseCategories:getAll', () =>
-    prisma.expenseCategory.findMany({ orderBy: { name: 'asc' } })
+    prisma.expenseCategory.findMany({ include: { account: true }, orderBy: { name: 'asc' } })
+  )
+
+  ipcHandle('expenseCategories:getAccounts', () =>
+    prisma.account.findMany({
+      where: { type: 'expense', isActive: true, children: { none: {} } },
+      select: { id: true, code: true, name: true },
+      orderBy: { code: 'asc' },
+    })
   )
 
   ipcHandle('expenseCategories:create', (_, data) =>
@@ -1982,7 +1990,7 @@ function setupIpcHandlers() {
     return prisma.$transaction(async (tx) => {
       const expense = await tx.expense.create({ data, include: { category: true } })
       await postExpenseJE(
-        { id: expense.id, amount: expense.amount, description: expense.description, date: data.date || new Date(), categoryName: expense.category?.name },
+        { id: expense.id, amount: expense.amount, description: expense.description, date: data.date || new Date(), categoryName: expense.category?.name, categoryAccountId: expense.category?.accountId },
         data.paymentMethod,
         tx,
       )
@@ -2244,13 +2252,20 @@ function setupIpcHandlers() {
     }
   }
 
-  async function postExpenseJE(expense: { id: number; amount: number; description: string | null; date: Date; categoryName?: string | null }, paymentMethod?: string | null, db: AccountingDb = prisma) {
+  async function postExpenseJE(expense: { id: number; amount: number; description: string | null; date: Date; categoryName?: string | null; categoryAccountId?: number | null }, paymentMethod?: string | null, db: AccountingDb = prisma) {
     await ensureStandardAccounts(db)
-    const [expAcc, cashAcc, bankAcc] = await Promise.all([
+    const [defaultExpenseAcc, cashAcc, bankAcc] = await Promise.all([
       findAccByCode('61', db), findAccByCode('1111', db), findAccByCode('1112', db),
     ])
+    const mappedExpenseAcc = expense.categoryAccountId
+      ? await db.account.findUnique({ where: { id: expense.categoryAccountId }, select: { id: true, type: true, isActive: true } })
+      : null
+    if (expense.categoryAccountId && (!mappedExpenseAcc || mappedExpenseAcc.type !== 'expense' || !mappedExpenseAcc.isActive)) {
+      throw new Error('الحساب المرتبط بنوع المصروف غير نشط أو ليس حساب مصروفات')
+    }
+    const expAcc = mappedExpenseAcc ?? defaultExpenseAcc
     const crAcc = (!paymentMethod || paymentMethod === 'cash') ? cashAcc : bankAcc
-    if (!expAcc || !crAcc) throw new Error('تعذر إيجاد حسابات المصاريف/النقدية في دليل الحسابات')
+    if (!expAcc || !crAcc) throw new Error('تعذر إيجاد حساب المصروف أو النقدية/البنك في دليل الحسابات')
     const desc = [expense.categoryName, expense.description].filter(Boolean).join(' - ')
     return autoJE({
       date: new Date(expense.date),
