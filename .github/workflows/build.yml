@@ -5,10 +5,12 @@ on:
     branches:
       - main
       - "fix/**"
+      - "accounting/**"
+      - "audit/**"
   pull_request:
     branches:
       - main
-      - "audit/**"
+      - "accounting/**"
 
 jobs:
   build:
