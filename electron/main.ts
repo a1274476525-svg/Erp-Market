@@ -561,7 +561,7 @@ function setupIpcHandlers() {
       }
       return { ...product, currentStock: initialStock }
     })
-  )
+  })
 
   ipcHandle('products:update', async (_, { id, ...rawData }) => {
     const data = {
