@@ -295,6 +295,7 @@ function setupIpcHandlers() {
     'voidOrder', 'createReturn', 'saveDraft', 'updateDraft', 'deleteDraft', 'confirmDraft',
     'updateStatus', 'execute', 'close', 'removeItem', 'updateItem', 'post', 'reverse',
     'backfillMissing', 'seedDefault', 'setDefault', 'syncStock', 'set', 'log', 'ignore',
+    'receivePayment', 'payInvoice',
     'unmatch', 'import', 'match', 'createFromLine', 'applyRules', 'selectImage', 'removeImage',
     'selectFolder', 'clearAllData', 'parseFile',
   ])
@@ -302,6 +303,8 @@ function setupIpcHandlers() {
     const [group, action] = channel.split(':')
     if (group === 'pos' && action === 'voidOrder') return ['/sales', '/pos']
     if (group === 'pos' && action === 'createReturn') return ['/returns', '/pos']
+    if (group === 'customers' && ['getPayments', 'receivePayment'].includes(action)) return ['/settlements', '/customers']
+    if (group === 'suppliers' && ['getPayments', 'payInvoice'].includes(action)) return ['/settlements', '/suppliers']
     if (group === 'stock' && action === 'waste') return ['/waste', '/stock']
     const paths: Record<string, string[]> = {
       products: ['/products'], productBarcodes: ['/products'], productUnits: ['/products'],
@@ -601,6 +604,63 @@ function setupIpcHandlers() {
     })
   )
 
+  ipcHandle('customers:getPayments', (_, customerId?: number) =>
+    prisma.customerPayment.findMany({
+      where: customerId ? { customerId } : undefined,
+      include: { customer: true, order: true },
+      orderBy: { date: 'desc' },
+    })
+  )
+
+  ipcHandle('customers:receivePayment', async (_, data: { orderId: number; amount: number; paymentMethod: string; date?: string | Date; reference?: string; notes?: string }) => {
+    const amount = Number(data.amount)
+    if (!Number.isFinite(amount) || amount <= 0) throw new Error('أدخل مبلغ تحصيل صحيحًا أكبر من صفر')
+    if (!['cash', 'card', 'instapay', 'vodafone'].includes(data.paymentMethod)) throw new Error('طريقة التحصيل غير مدعومة')
+    const paymentDate = data.date ? new Date(data.date) : new Date()
+    if (Number.isNaN(paymentDate.getTime())) throw new Error('تاريخ التحصيل غير صحيح')
+
+    return prisma.$transaction(async (tx) => {
+      const order = await tx.posOrder.findUnique({ where: { id: data.orderId } })
+      if (!order || order.status !== 'completed' || !order.customerId) throw new Error('الفاتورة الآجلة أو العميل غير موجود')
+      if (order.paymentMethod !== 'credit') throw new Error('هذه الفاتورة ليست مسجلة على الحساب')
+      const paid = await tx.customerPayment.aggregate({ where: { orderId: order.id }, _sum: { amount: true } })
+      const outstanding = Math.max(0, order.total - (paid._sum.amount ?? 0))
+      if (amount > outstanding + 0.005) throw new Error(`مبلغ التحصيل أكبر من المتبقي: ${outstanding.toFixed(2)}`)
+
+      await ensureStandardAccounts(tx)
+      const cashAcc = await findAccByCode('1111', tx)
+      const bankAcc = await findAccByCode('1112', tx)
+      const receivableAcc = await findAccByCode('1121', tx)
+      const debitAcc = data.paymentMethod === 'cash' ? cashAcc : bankAcc
+      if (!debitAcc || !receivableAcc) throw new Error('حساب النقدية/البنك أو العملاء غير موجود في دليل الحسابات')
+
+      const payment = await tx.customerPayment.create({
+        data: {
+          customerId: order.customerId,
+          orderId: order.id,
+          amount,
+          paymentMethod: data.paymentMethod,
+          date: paymentDate,
+          reference: data.reference?.trim() || null,
+          notes: data.notes?.trim() || null,
+        },
+      })
+      await autoJE({
+        date: paymentDate,
+        description: `تحصيل من عميل - ${order.orderNumber} - RCPT-${payment.id}`,
+        reference: data.reference || `RCPT-${payment.id}`,
+        source: 'customer_payment',
+        sourceId: payment.id,
+        lines: [
+          { accountId: debitAcc.id, debit: amount, credit: 0, description: 'تحصيل نقدي/بنكي' },
+          { accountId: receivableAcc.id, debit: 0, credit: amount, description: 'تخفيض مديونية العميل' },
+        ],
+        db: tx,
+      })
+      return { ...payment, outstandingAfter: Math.max(0, outstanding - amount) }
+    })
+  })
+
   // ─── SUPPLIERS ─────────────────────────────────────────────────
   ipcHandle('suppliers:getAll', () =>
     prisma.supplier.findMany({ orderBy: { name: 'asc' } })
@@ -618,11 +678,67 @@ function setupIpcHandlers() {
     prisma.supplier.delete({ where: { id } })
   )
 
+  ipcHandle('suppliers:getPayments', (_, supplierId?: number) =>
+    prisma.supplierPayment.findMany({
+      where: supplierId ? { supplierId } : undefined,
+      include: { supplier: true, invoice: true },
+      orderBy: { date: 'desc' },
+    })
+  )
+
+  ipcHandle('suppliers:payInvoice', async (_, data: { invoiceId: number; amount: number; paymentMethod: string; date?: string | Date; reference?: string; notes?: string }) => {
+    const amount = Number(data.amount)
+    if (!Number.isFinite(amount) || amount <= 0) throw new Error('أدخل مبلغ سداد صحيحًا أكبر من صفر')
+    if (!['cash', 'card', 'instapay', 'vodafone'].includes(data.paymentMethod)) throw new Error('طريقة السداد غير مدعومة')
+    const paymentDate = data.date ? new Date(data.date) : new Date()
+    if (Number.isNaN(paymentDate.getTime())) throw new Error('تاريخ السداد غير صحيح')
+
+    return prisma.$transaction(async (tx) => {
+      const invoice = await tx.purchaseInvoice.findUnique({ where: { id: data.invoiceId } })
+      if (!invoice || invoice.status !== 'confirmed' || !invoice.supplierId) throw new Error('فاتورة المورد غير موجودة أو غير مرتبطة بمورد')
+      const paid = await tx.supplierPayment.aggregate({ where: { invoiceId: invoice.id }, _sum: { amount: true } })
+      const outstanding = Math.max(0, invoice.total - (paid._sum.amount ?? 0))
+      if (amount > outstanding + 0.005) throw new Error(`مبلغ السداد أكبر من المتبقي: ${outstanding.toFixed(2)}`)
+
+      await ensureStandardAccounts(tx)
+      const payableAcc = await findAccByCode('2111', tx)
+      const cashAcc = await findAccByCode('1111', tx)
+      const bankAcc = await findAccByCode('1112', tx)
+      const creditAcc = data.paymentMethod === 'cash' ? cashAcc : bankAcc
+      if (!payableAcc || !creditAcc) throw new Error('حساب الموردين أو النقدية/البنك غير موجود في دليل الحسابات')
+
+      const payment = await tx.supplierPayment.create({
+        data: {
+          supplierId: invoice.supplierId,
+          invoiceId: invoice.id,
+          amount,
+          paymentMethod: data.paymentMethod,
+          date: paymentDate,
+          reference: data.reference?.trim() || null,
+          notes: data.notes?.trim() || null,
+        },
+      })
+      await autoJE({
+        date: paymentDate,
+        description: `سداد مورد - ${invoice.invoiceNumber ?? `INV-${invoice.id}`} - PAY-${payment.id}`,
+        reference: data.reference || `PAY-${payment.id}`,
+        source: 'supplier_payment',
+        sourceId: payment.id,
+        lines: [
+          { accountId: payableAcc.id, debit: amount, credit: 0, description: 'تخفيض مديونية المورد' },
+          { accountId: creditAcc.id, debit: 0, credit: amount, description: 'سداد نقدي/بنكي' },
+        ],
+        db: tx,
+      })
+      return { ...payment, outstandingAfter: Math.max(0, outstanding - amount) }
+    })
+  })
+
   // ─── PURCHASE INVOICES ─────────────────────────────────────────
   ipcHandle('invoices:getAll', () =>
     prisma.purchaseInvoice.findMany({
       where: { status: 'confirmed' },
-      include: { supplier: true, items: { include: { product: true } } },
+      include: { supplier: true, items: { include: { product: true } }, payments: true },
       orderBy: { invoiceDate: 'desc' },
     })
   )
@@ -647,8 +763,15 @@ function setupIpcHandlers() {
         if (!Number.isFinite(item.quantity) || item.quantity <= 0 || !Number.isFinite(item.unitPrice) || item.unitPrice < 0) {
           throw new Error('بيانات صنف في فاتورة الشراء غير صالحة')
         }
+        const productCost = await tx.product.findUnique({ where: { id: item.productId }, select: { costPrice: true } })
+        if (!productCost) throw new Error('المنتج غير موجود')
+        const stockBefore = await tx.warehouseStock.aggregate({ where: { productId: item.productId }, _sum: { quantity: true } })
+        const quantityBefore = stockBefore._sum.quantity ?? 0
+        const weightedAverageCost = quantityBefore + item.quantity > 0
+          ? ((quantityBefore * productCost.costPrice) + (item.quantity * item.unitPrice)) / (quantityBefore + item.quantity)
+          : item.unitPrice
         await changeWarehouseStock(tx, warehouse.id, item.productId, item.quantity)
-        await tx.product.update({ where: { id: item.productId }, data: { costPrice: item.unitPrice } })
+        await tx.product.update({ where: { id: item.productId }, data: { costPrice: weightedAverageCost } })
         await tx.stockMovement.create({
           data: { productId: item.productId, quantity: item.quantity, type: 'purchase', referenceId: inv.id },
         })
@@ -773,6 +896,10 @@ function setupIpcHandlers() {
 
   // ─── POS ───────────────────────────────────────────────────────
   ipcHandle('pos:createOrder', async (_, { items, customerId, ...header }) => {
+    if (!['cash', 'card', 'instapay', 'vodafone', 'credit'].includes(header.paymentMethod ?? 'cash')) {
+      throw new Error('طريقة دفع غير مدعومة')
+    }
+    if (header.paymentMethod === 'credit' && !customerId) throw new Error('اختر العميل أولاً لتسجيل الفاتورة آجلاً')
     if (!Array.isArray(items) || items.length === 0) throw new Error('أضف صنفًا واحدًا على الأقل')
     for (const item of items) {
       if (!Number.isInteger(item.productId) || !Number.isFinite(item.quantity) || item.quantity <= 0) {
@@ -789,6 +916,10 @@ function setupIpcHandlers() {
       })
       const costByProduct = new Map(products.map(product => [product.id, product.costPrice]))
       if (products.length !== productIds.length) throw new Error('يوجد منتج غير موجود أو غير نشط')
+      if (header.paymentMethod === 'credit') {
+        const customer = await tx.customer.findUnique({ where: { id: customerId }, select: { id: true } })
+        if (!customer) throw new Error('العميل المحدد غير موجود')
+      }
       const o = await tx.posOrder.create({
         data: {
           orderNumber: `ORD-${num}`,
@@ -826,7 +957,7 @@ function setupIpcHandlers() {
 
   ipcHandle('pos:getOrders', (_, limit = 100) =>
     prisma.posOrder.findMany({
-      include: { items: { include: { product: true } }, customer: true },
+      include: { items: { include: { product: true } }, customer: true, payments: true },
       orderBy: { createdAt: 'desc' },
       take: limit,
     })
@@ -945,11 +1076,13 @@ function setupIpcHandlers() {
       }
 
       await ensureStandardAccounts(tx)
-      const [salesAcc, cashAcc, bankAcc, vatAcc, cogsAcc, invAcc] = await Promise.all([
-        findAccByCode('4111', tx), findAccByCode('1111', tx), findAccByCode('1112', tx),
+      const [salesAcc, cashAcc, bankAcc, receivableAcc, vatAcc, cogsAcc, invAcc] = await Promise.all([
+        findAccByCode('412', tx), findAccByCode('1111', tx), findAccByCode('1112', tx), findAccByCode('1121', tx),
         findAccByCode('2121', tx), findAccByCode('521', tx), findAccByCode('1131', tx),
       ])
-      const refundAcc = order.paymentMethod === 'cash' ? cashAcc : bankAcc
+      const refundAcc = order.paymentMethod === 'credit'
+        ? receivableAcc
+        : order.paymentMethod === 'cash' ? cashAcc : bankAcc
       if (!salesAcc || !refundAcc || !cogsAcc || !invAcc) {
         throw new Error('تعذر إيجاد حسابات مرتجع المبيعات والنقدية/البنك والمخزون والتكلفة')
       }
@@ -1931,15 +2064,20 @@ function setupIpcHandlers() {
     })
   }
 
-  async function postSaleJE(order: { id: number; orderNumber: string; createdAt: Date; total: number; subtotal: number; discountAmount: number; taxAmount: number; paymentMethod: string; items: { productId: number; quantity: number; unitCost: number }[] }, db: AccountingDb = prisma) {
+  async function postSaleJE(order: { id: number; orderNumber: string; createdAt: Date; customerId?: number | null; total: number; subtotal: number; discountAmount: number; taxAmount: number; paymentMethod: string; items: { productId: number; quantity: number; unitCost: number }[] }, db: AccountingDb = prisma) {
     await ensureStandardAccounts(db)
-    const [cashAcc, bankAcc, salesAcc, vatAcc, cogsAcc, invAcc] = await Promise.all([
-      findAccByCode('1111', db), findAccByCode('1112', db),
+    const [cashAcc, bankAcc, receivableAcc, salesAcc, vatAcc, cogsAcc, invAcc] = await Promise.all([
+      findAccByCode('1111', db), findAccByCode('1112', db), findAccByCode('1121', db),
       findAccByCode('4111', db), findAccByCode('2121', db),
       findAccByCode('521', db),  findAccByCode('1131', db),
     ])
-    const drAcc = order.paymentMethod === 'cash' ? cashAcc : bankAcc
-    if (!drAcc || !salesAcc) throw new Error('تعذر إيجاد حسابات النقدية/المبيعات في دليل الحسابات')
+    const drAcc = order.paymentMethod === 'credit'
+      ? receivableAcc
+      : order.paymentMethod === 'cash' ? cashAcc : bankAcc
+    if (!drAcc || !salesAcc) throw new Error('تعذر إيجاد حساب النقدية/البنوك/العملاء أو المبيعات في دليل الحسابات')
+    if (order.paymentMethod === 'credit' && !order.customerId) {
+      throw new Error('يجب تحديد العميل عند تسجيل البيع الآجل')
+    }
     const discountAmount = Number(order.discountAmount ?? 0)
     if (!Number.isFinite(discountAmount) || discountAmount < 0 || discountAmount > order.subtotal) {
       throw new Error('قيمة خصم فاتورة البيع غير صالحة')
@@ -2622,29 +2760,107 @@ function setupIpcHandlers() {
   // ─── EXTENDED REPORTS ─────────────────────────────────────────
 
   ipcHandle('reports:customerStatement', async (_, { customerId, from, to }: any = {}) => {
-    const where: any = { status: 'completed' }
-    if (customerId) where.customerId = Number(customerId)
-    if (from) { const d = new Date(from); d.setUTCHours(0,0,0,0); where.createdAt = { ...where.createdAt, gte: d } }
-    if (to)   { const d = new Date(to); d.setUTCDate(d.getUTCDate()+1); d.setUTCHours(0,0,0,0); where.createdAt = { ...where.createdAt, lt: d } }
-    const orders = await prisma.posOrder.findMany({
-      where, include: { customer: true, items: { include: { product: true } } }, orderBy: { createdAt: 'asc' },
+    const id = Number(customerId)
+    if (!Number.isInteger(id) || id <= 0) throw new Error('اختر عميلًا صحيحًا')
+    const dateRange = (value: string, end = false) => {
+      if (!value) return undefined
+      const d = new Date(value)
+      if (Number.isNaN(d.getTime())) throw new Error('نطاق تاريخ غير صحيح')
+      if (end) { d.setUTCDate(d.getUTCDate() + 1); d.setUTCHours(0, 0, 0, 0) }
+      else d.setUTCHours(0, 0, 0, 0)
+      return d
+    }
+    const start = dateRange(from)
+    const end = dateRange(to, true)
+    if (start && end && start >= end) throw new Error('تاريخ البداية يجب أن يسبق تاريخ النهاية')
+    const orderWhere: any = { customerId: id, status: 'completed', paymentMethod: 'credit' }
+    const paymentWhere: any = { customerId: id }
+    const returnWhere: any = { order: { customerId: id, paymentMethod: 'credit', status: 'completed' } }
+    if (start) {
+      orderWhere.createdAt = { gte: start, ...(end ? { lt: end } : {}) }
+      paymentWhere.date = { gte: start, ...(end ? { lt: end } : {}) }
+      returnWhere.returnDate = { gte: start, ...(end ? { lt: end } : {}) }
+    } else if (end) {
+      orderWhere.createdAt = { lt: end }
+      paymentWhere.date = { lt: end }
+      returnWhere.returnDate = { lt: end }
+    }
+    const openingWhereOrders: any = { customerId: id, status: 'completed', paymentMethod: 'credit', ...(start ? { createdAt: { lt: start } } : { id: -1 }) }
+    const openingWherePayments: any = { customerId: id, ...(start ? { date: { lt: start } } : { id: -1 }) }
+    const openingWhereReturns: any = { order: { customerId: id, paymentMethod: 'credit', status: 'completed' }, ...(start ? { returnDate: { lt: start } } : { id: -1 }) }
+    const [orders, payments, returns, customer, openingOrders, openingPayments, openingReturns] = await Promise.all([
+      prisma.posOrder.findMany({ where: orderWhere, orderBy: { createdAt: 'asc' } }),
+      prisma.customerPayment.findMany({ where: paymentWhere, orderBy: { date: 'asc' }, include: { order: true } }),
+      prisma.saleReturn.findMany({ where: returnWhere, orderBy: { returnDate: 'asc' }, include: { order: true } }),
+      prisma.customer.findUnique({ where: { id } }),
+      prisma.posOrder.aggregate({ where: openingWhereOrders, _sum: { total: true } }),
+      prisma.customerPayment.aggregate({ where: openingWherePayments, _sum: { amount: true } }),
+      prisma.saleReturn.findMany({ where: openingWhereReturns, include: { order: true } }),
+    ])
+    if (!customer) throw new Error('العميل غير موجود')
+    const returnValue = (ret: any) => {
+      const ratio = ret.order.subtotal > 0 ? ret.total / ret.order.subtotal : 0
+      return Math.max(0, ret.total - (ret.order.discountAmount ?? 0) * ratio + (ret.order.taxAmount ?? 0) * ratio)
+    }
+    const openingReturnTotal = openingReturns.reduce((sum: number, ret: any) => sum + returnValue(ret), 0)
+    const openingBalance = (openingOrders._sum.total ?? 0) - (openingPayments._sum.amount ?? 0) - openingReturnTotal
+    const events = [
+      ...orders.map(o => ({ date: o.createdAt, description: `فاتورة مبيعات آجلة ${o.orderNumber}`, amount: o.total, debit: o.total, credit: 0, kind: 'sale' })),
+      ...payments.map(p => ({ date: p.date, description: `تحصيل على ${p.order.orderNumber}${p.reference ? ` - ${p.reference}` : ''}`, amount: -p.amount, debit: 0, credit: p.amount, kind: 'receipt' })),
+      ...returns.map(ret => { const value = returnValue(ret); return { date: ret.returnDate, description: `إشعار دائن / مرتجع ${ret.id}`, amount: -value, debit: 0, credit: value, kind: 'return' } }),
+    ].sort((x, y) => new Date(x.date).getTime() - new Date(y.date).getTime())
+    let balance = openingBalance
+    const rows = events.map(event => {
+      balance += event.amount
+      return { ...event, balance }
     })
-    let running = 0
-    const rows = orders.map(o => { running += o.total; return { ...o, runningBalance: running } })
-    return { rows, total: orders.reduce((s, o) => s + o.total, 0), count: orders.length }
+    const totalSales = orders.reduce((sum, o) => sum + o.total, 0)
+    const totalPayments = payments.reduce((sum, p) => sum + p.amount, 0)
+    const totalReturns = returns.reduce((sum, ret) => sum + returnValue(ret), 0)
+    return { customer, rows, openingBalance, total: balance, balance, totalSales, totalPayments, totalReturns, count: rows.length }
   })
 
   ipcHandle('reports:supplierStatement', async (_, { supplierId, from, to }: any = {}) => {
-    const where: any = { status: 'confirmed' }
-    if (supplierId) where.supplierId = Number(supplierId)
-    if (from) { const d = new Date(from); d.setUTCHours(0,0,0,0); where.invoiceDate = { ...where.invoiceDate, gte: d } }
-    if (to)   { const d = new Date(to); d.setUTCDate(d.getUTCDate()+1); d.setUTCHours(0,0,0,0); where.invoiceDate = { ...where.invoiceDate, lt: d } }
-    const invoices = await prisma.purchaseInvoice.findMany({
-      where, include: { supplier: true, items: { include: { product: true } } }, orderBy: { invoiceDate: 'asc' },
+    const id = Number(supplierId)
+    if (!Number.isInteger(id) || id <= 0) throw new Error('اختر موردًا صحيحًا')
+    const dateRange = (value: string, end = false) => {
+      if (!value) return undefined
+      const d = new Date(value)
+      if (Number.isNaN(d.getTime())) throw new Error('نطاق تاريخ غير صحيح')
+      if (end) { d.setUTCDate(d.getUTCDate() + 1); d.setUTCHours(0, 0, 0, 0) }
+      else d.setUTCHours(0, 0, 0, 0)
+      return d
+    }
+    const start = dateRange(from)
+    const end = dateRange(to, true)
+    if (start && end && start >= end) throw new Error('تاريخ البداية يجب أن يسبق تاريخ النهاية')
+    const invoiceWhere: any = { supplierId: id, status: 'confirmed' }
+    const paymentWhere: any = { supplierId: id }
+    if (start) { invoiceWhere.invoiceDate = { gte: start, ...(end ? { lt: end } : {}) }; paymentWhere.date = { gte: start, ...(end ? { lt: end } : {}) } }
+    else if (end) { invoiceWhere.invoiceDate = { lt: end }; paymentWhere.date = { lt: end } }
+    const openingWhereInvoices: any = { supplierId: id, status: 'confirmed', ...(start ? { invoiceDate: { lt: start } } : { id: -1 }) }
+    const openingWherePayments: any = { supplierId: id, ...(start ? { date: { lt: start } } : { id: -1 }) }
+    const [invoices, payments, supplier, openingInvoices, openingPayments] = await Promise.all([
+      prisma.purchaseInvoice.findMany({ where: invoiceWhere, orderBy: { invoiceDate: 'asc' } }),
+      prisma.supplierPayment.findMany({ where: paymentWhere, orderBy: { date: 'asc' }, include: { invoice: true } }),
+      prisma.supplier.findUnique({ where: { id } }),
+      prisma.purchaseInvoice.aggregate({ where: openingWhereInvoices, _sum: { total: true } }),
+      prisma.supplierPayment.aggregate({ where: openingWherePayments, _sum: { amount: true } }),
+    ])
+    if (!supplier) throw new Error('المورد غير موجود')
+    const openingBalance = (openingInvoices._sum.total ?? 0) - (openingPayments._sum.amount ?? 0)
+    const events = [
+      ...invoices.map(i => ({ date: i.invoiceDate, description: `فاتورة مشتريات ${i.invoiceNumber ?? `INV-${i.id}`}`, amount: i.total, debit: 0, credit: i.total, kind: 'purchase' })),
+      ...payments.map(p => ({ date: p.date, description: `سداد على ${p.invoice.invoiceNumber ?? `INV-${p.invoice.id}`}${p.reference ? ` - ${p.reference}` : ''}`, amount: -p.amount, debit: p.amount, credit: 0, kind: 'payment' })),
+    ].sort((x, y) => new Date(x.date).getTime() - new Date(y.date).getTime())
+    let balance = openingBalance
+    const rows = events.map(event => {
+      balance += event.amount
+      return { ...event, balance }
     })
-    let running = 0
-    const rows = invoices.map(i => { running += i.total; return { ...i, runningBalance: running } })
-    return { rows, total: invoices.reduce((s, i) => s + i.total, 0), count: invoices.length }
+    const totalInvoices = invoices.reduce((sum, i) => sum + i.total, 0)
+    const totalPayments = payments.reduce((sum, p) => sum + p.amount, 0)
+    return { supplier, rows, openingBalance, total: balance, balance, totalInvoices, totalPayments, count: rows.length }
   })
 
   ipcHandle('reports:vatDetails', async (_, { from, to }: any = {}) => {
@@ -2941,6 +3157,8 @@ function setupIpcHandlers() {
         await tx.saleReturn.deleteMany({})
       }
       if (removeSales) {
+        await tx.customerPayment.deleteMany({})
+        await tx.journalEntry.deleteMany({ where: { source: 'customer_payment' } })
         await tx.posOrderItem.deleteMany({})
         await tx.posOrder.deleteMany({})
         await tx.journalEntry.deleteMany({ where: { source: 'sale' } })
@@ -2952,6 +3170,8 @@ function setupIpcHandlers() {
       }
 
       if (removePurchases) {
+        await tx.supplierPayment.deleteMany({})
+        await tx.journalEntry.deleteMany({ where: { source: 'supplier_payment' } })
         await tx.purchaseItem.deleteMany({})
         await tx.purchaseInvoice.deleteMany({})
         await tx.purchaseRequestItem.deleteMany({})
@@ -2992,15 +3212,17 @@ function setupIpcHandlers() {
       }
 
       if (all || selected.has('customers')) {
-        // Preserve sales documents when only the customer master data is cleared.
+        // Preserve historical receipts and sales while detaching the optional customer master record.
         await tx.posOrder.updateMany({ data: { customerId: null } })
+        await tx.customerPayment.updateMany({ data: { customerId: null } })
         await tx.customer.deleteMany({})
       }
 
       if (all || selected.has('suppliers')) {
-        // Supplier references are optional; detach them before removing suppliers.
+        // Supplier references are optional; preserve payment history and detach supplier master records.
         await tx.purchaseInvoice.updateMany({ data: { supplierId: null } })
         await tx.purchaseRequest.updateMany({ data: { supplierId: null } })
+        await tx.supplierPayment.updateMany({ data: { supplierId: null } })
         await tx.supplier.deleteMany({})
       }
 
