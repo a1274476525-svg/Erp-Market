@@ -451,7 +451,20 @@ function setupIpcHandlers() {
         where: { warehouseId, productId, quantity: { gte: -delta } },
         data: { quantity: { decrement: -delta } },
       })
-      if (changed.count !== 1) throw new Error('المخزون غير كافٍ في المخزن المحدد')
+      if (changed.count !== 1) {
+        const [stock, product] = await Promise.all([
+          tx.warehouseStock.findUnique({
+            where: { warehouseId_productId: { warehouseId, productId } },
+            select: { quantity: true },
+          }),
+          tx.product.findUnique({ where: { id: productId }, select: { name: true } }),
+        ])
+        const available = stock?.quantity ?? 0
+        const required = -delta
+        throw new Error(
+          `المخزون غير كافٍ للمنتج "${product?.name ?? productId}". المتاح: ${available}، المطلوب: ${required}`
+        )
+      }
     } else {
       await tx.warehouseStock.upsert({
         where: { warehouseId_productId: { warehouseId, productId } },
