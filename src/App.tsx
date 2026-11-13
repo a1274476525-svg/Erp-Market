@@ -42,6 +42,7 @@ import ChartOfAccountsPage  from './pages/ChartOfAccounts'
 import BanksPage            from './pages/Banks'
 import FinancialReportsPage from './pages/FinancialReports'
 import JournalEntriesPage   from './pages/JournalEntries'
+import SettlementsPage      from './pages/Settlements'
 
 interface NavItem { to: string; label: string; icon: React.ElementType; exact?: boolean }
 
@@ -156,6 +157,7 @@ function Sidebar() {
           { to: '/chart-of-accounts', label: 'دليل الحسابات',  icon: BookOpen },
           { to: '/banks',             label: 'البنوك والصناديق', icon: Landmark },
           { to: '/journal-entries',   label: 'قيود اليومية',    icon: BookOpen },
+          { to: '/settlements',       label: 'التحصيلات وسداد الموردين', icon: Wallet },
         ]} />
 
         <div className="border-t border-slate-800 pt-1" />
@@ -256,6 +258,7 @@ function AppContent() {
             <Route path="/chart-of-accounts"  element={<ProtectedRoute path="/chart-of-accounts"  element={<ChartOfAccountsPage />} />} />
             <Route path="/banks"              element={<ProtectedRoute path="/banks"              element={<BanksPage />} />} />
             <Route path="/journal-entries"  element={<ProtectedRoute path="/journal-entries"  element={<JournalEntriesPage />} />} />
+            <Route path="/settlements"      element={<ProtectedRoute path="/settlements"      element={<SettlementsPage />} />} />
             <Route path="/financial-reports"  element={<ProtectedRoute path="/financial-reports"  element={<FinancialReportsPage />} />} />
             <Route path="/reports"            element={<ProtectedRoute path="/reports"            element={<ReportsHub />} />} />
             <Route path="/reports/:reportId"  element={<ProtectedRoute path="/reports"            element={<ReportsHub />} />} />
