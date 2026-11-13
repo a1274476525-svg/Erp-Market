@@ -1173,7 +1173,7 @@ function setupIpcHandlers() {
         if (quantity > soldQuantity - alreadyReturned) {
           throw new Error(`كمية المرتجع تتجاوز الكمية المباعة للصنف ${soldItems[0].productName}`)
         }
-        const unitPrice = soldItems[0].unitPrice
+        const unitPrice = soldItems.reduce((sum, item) => sum + item.unitPrice * item.quantity, 0) / soldQuantity
         return {
           productId,
           productName: soldItems[0].productName,
