@@ -56,13 +56,23 @@ export default function SettlementsPage() {
       return orders.filter(o => o.status === 'completed' && o.paymentMethod === 'credit' && o.customerId)
         .map(o => {
           const paid = (o.payments ?? []).reduce((sum: number, p: any) => sum + Number(p.amount || 0), 0)
-          return { id: o.id, label: o.orderNumber, party: o.customer?.name || 'عميل', date: o.createdAt, total: o.total, paid, due: Math.max(0, o.total - paid) }
+          const returned = (o.returns ?? []).reduce((sum: number, ret: any) => {
+            const ratio = Number(o.subtotal) > 0 ? Number(ret.total || 0) / Number(o.subtotal) : 0
+            const discountShare = Number(o.discountAmount || 0) * ratio
+            const taxShare = Number(o.taxAmount || 0) * ratio
+            return sum + Number(ret.total || 0) - discountShare + taxShare
+          }, 0)
+          return { id: o.id, label: o.orderNumber, party: o.customer?.name || 'عميل', date: o.createdAt, total: o.total, paid, returned, due: Math.max(0, o.total - paid - returned) }
         }).filter(o => o.due > 0.005)
     }
     return invoices.filter(i => i.status === 'confirmed' && i.supplierId)
       .map(i => {
         const paid = (i.payments ?? []).reduce((sum: number, p: any) => sum + Number(p.amount || 0), 0)
-        return { id: i.id, label: i.invoiceNumber || `INV-${i.id}`, party: i.supplier?.name || 'مورد', date: i.invoiceDate, total: i.total, paid, due: Math.max(0, i.total - paid) }
+        const returned = (i.returns ?? []).reduce((sum: number, ret: any) => {
+          const taxShare = i.subtotal > 0 ? Number(i.taxAmount || 0) * Number(ret.total || 0) / i.subtotal : 0
+          return sum + Number(ret.total || 0) + taxShare
+        }, 0)
+        return { id: i.id, label: i.invoiceNumber || `INV-${i.id}`, party: i.supplier?.name || 'مورد', date: i.invoiceDate, total: i.total, paid, returned, due: Math.max(0, i.total - paid - returned) }
       }).filter(i => i.due > 0.005)
   }, [mode, orders, invoices])
 
