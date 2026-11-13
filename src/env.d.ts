@@ -25,12 +25,16 @@ interface Window {
       update: (data: any) => Promise<any>
       delete: (id: number) => Promise<any>
       addPoints: (data: any) => Promise<any>
+      getPayments: (customerId?: number) => Promise<any[]>
+      receivePayment: (data: any) => Promise<any>
     }
     suppliers: {
       getAll: () => Promise<any[]>
       create: (data: any) => Promise<any>
       update: (data: any) => Promise<any>
       delete: (id: number) => Promise<any>
+      getPayments: (supplierId?: number) => Promise<any[]>
+      payInvoice: (data: any) => Promise<any>
     }
     invoices: {
       getAll: () => Promise<any[]>
