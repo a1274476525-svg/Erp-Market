@@ -44,6 +44,7 @@ interface Window {
       updateDraft: (data: any) => Promise<any>
       deleteDraft: (id: number) => Promise<any>
       confirmDraft: (id: number) => Promise<any>
+      createReturn: (data: any) => Promise<any>
     }
     purchaseRequests: {
       getAll: () => Promise<any[]>
