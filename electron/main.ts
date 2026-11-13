@@ -484,7 +484,10 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcHandle('products:getByBarcode', async (_, barcode: string) => {
+  ipcHandle('products:getByBarcode', async (_, rawBarcode: string) => {
+    // Preserve leading zeros and barcode symbols; only remove surrounding whitespace.
+    const barcode = String(rawBarcode ?? '').trim()
+    if (!barcode) return null
     const pb = await prisma.productBarcode.findUnique({ where: { barcode }, include: { product: { include: { category: true } } } })
     if (pb) return { ...pb.product, _barcodeUnit: pb.unit, _conversionFactor: pb.conversionFactor }
     return prisma.product.findUnique({ where: { barcode }, include: { category: true } })
@@ -494,10 +497,13 @@ function setupIpcHandlers() {
     prisma.productBarcode.findMany({ where: { productId }, orderBy: { createdAt: 'asc' } })
   )
   ipcHandle('productBarcodes:create', (_, data) =>
-    prisma.productBarcode.create({ data })
+    prisma.productBarcode.create({ data: { ...data, barcode: String(data.barcode ?? '').trim() } })
   )
   ipcHandle('productBarcodes:update', (_, { id, ...data }) =>
-    prisma.productBarcode.update({ where: { id }, data })
+    prisma.productBarcode.update({
+      where: { id },
+      data: { ...data, ...(data.barcode !== undefined ? { barcode: String(data.barcode).trim() } : {}) },
+    })
   )
   ipcHandle('productBarcodes:delete', (_, id: number) =>
     prisma.productBarcode.delete({ where: { id } })
@@ -526,8 +532,12 @@ function setupIpcHandlers() {
     return `PRD-${String(num).padStart(4, '0')}`
   }
 
-  ipcHandle('products:create', async (_, data) =>
-    prisma.$transaction(async (tx) => {
+  ipcHandle('products:create', async (_, rawData) => {
+    const data = {
+      ...rawData,
+      barcode: typeof rawData.barcode === 'string' ? rawData.barcode.trim() || null : rawData.barcode,
+    }
+    return prisma.$transaction(async (tx) => {
       const sku = data.sku || await nextSku()
       const initialStock = Number(data.currentStock ?? 0)
       if (!Number.isFinite(initialStock) || initialStock < 0) throw new Error('الرصيد الافتتاحي غير صالح')
@@ -553,7 +563,13 @@ function setupIpcHandlers() {
     })
   )
 
-  ipcHandle('products:update', async (_, { id, ...data }) => {
+  ipcHandle('products:update', async (_, { id, ...rawData }) => {
+    const data = {
+      ...rawData,
+      ...(rawData.barcode !== undefined
+        ? { barcode: typeof rawData.barcode === 'string' ? rawData.barcode.trim() || null : rawData.barcode }
+        : {}),
+    }
     const old = await prisma.product.findUnique({ where: { id } })
     if (old && data.costPrice !== undefined && data.costPrice !== old.costPrice) {
       await prisma.priceHistory.create({
