@@ -10,6 +10,7 @@ export const PAGES = [
   { path: '/suppliers',         label: 'الموردون' },
   { path: '/purchase-requests', label: 'طلبات الشراء' },
   { path: '/invoices',          label: 'فواتير الشراء' },
+  { path: '/purchase-returns',  label: 'مرتجعات المشتريات' },
   { path: '/stock',             label: 'حركات المخزون' },
   { path: '/waste',             label: 'الهدر' },
   { path: '/inventory',         label: 'جرد المخزون' },
