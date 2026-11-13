@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { Plus, Search, Edit2, Trash2, ToggleLeft, ToggleRight, Package, Image, Clock, X } from 'lucide-react'
 import type { Product, Category, PriceHistory } from '../types'
 import { Modal, Field, inputCls, SaveCancelButtons, DeleteConfirm, Badge, PageHeader } from '../components/ui'
@@ -184,12 +184,45 @@ export default function Products() {
 
 // ─── Thumbnail: loads image data via IPC ──────────────────────
 function ProductThumb({ imagePath }: { imagePath: string }) {
+  const [visible, setVisible] = useState(false)
   const [src, setSrc] = useState<string | null>(null)
+  const containerRef = useRef<HTMLDivElement>(null)
+
+  // Do not read and base64-encode every product image as soon as the list mounts.
+  // Load thumbnails only when their rows approach the visible viewport.
   useEffect(() => {
-    window.api.products.getImageData(imagePath).then(setSrc)
-  }, [imagePath])
-  if (!src) return <div className="w-8 h-8 bg-slate-100 rounded animate-pulse" />
-  return <img src={src} alt="" className="w-8 h-8 rounded object-cover border border-slate-200" />
+    const element = containerRef.current
+    if (!element) return
+    if (typeof IntersectionObserver === 'undefined') {
+      setVisible(true)
+      return
+    }
+    const observer = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) {
+        setVisible(true)
+        observer.disconnect()
+      }
+    }, { rootMargin: '160px' })
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [])
+
+  useEffect(() => {
+    if (!visible) return
+    let active = true
+    window.api.products.getImageData(imagePath)
+      .then(data => { if (active) setSrc(data) })
+      .catch(() => { if (active) setSrc(null) })
+    return () => { active = false }
+  }, [imagePath, visible])
+
+  return (
+    <div ref={containerRef} className="w-8 h-8 flex-shrink-0">
+      {src
+        ? <img src={src} alt="" loading="lazy" className="w-8 h-8 rounded object-cover border border-slate-200" />
+        : <div className="w-8 h-8 bg-slate-100 rounded" />}
+    </div>
+  )
 }
 
 // ─── Price History Modal ───────────────────────────────────────
