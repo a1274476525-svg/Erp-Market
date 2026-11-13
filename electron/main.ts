@@ -859,7 +859,7 @@ function setupIpcHandlers() {
         where: { id: data.invoiceId },
         include: { items: true, returns: { include: { items: true } } },
       })
-      if (!invoice || invoice.status !== 'confirmed') throw new Error('فاتورة الشراء غير موجودة أو غير مؤكدة')
+      if (!invoice || invoice.status !== 'confirmed' || !invoice.supplierId) throw new Error('فاتورة الشراء غير موجودة أو غير مؤكدة أو غير مرتبطة بمورد')
       if (!Number.isFinite(invoice.subtotal) || invoice.subtotal <= 0) throw new Error('لا يمكن حساب ضريبة مرتجع لفاتورة مجموعها صفر')
 
       const requested = new Map<number, number>()
