@@ -68,6 +68,7 @@ model Product {
   createdAt        DateTime          @default(now())
 
   purchaseItems         PurchaseItem[]
+  purchaseReturnItems   PurchaseReturnItem[]
   purchaseRequestItems  PurchaseRequestItem[]
   saleItems             PosOrderItem[]
   returnItems           SaleReturnItem[]
@@ -157,6 +158,7 @@ model PurchaseInvoice {
   createdAt     DateTime       @default(now())
   items         PurchaseItem[]
   payments      SupplierPayment[]
+  returns       PurchaseReturn[]
 }
 
 model PurchaseItem {
@@ -545,4 +547,29 @@ model SupplierPayment {
   reference     String?
   notes         String?
   createdAt     DateTime       @default(now())
+}
+
+
+// ─── PURCHASE RETURNS / SUPPLIER CREDIT NOTES ────────────────────
+model PurchaseReturn {
+  id          Int                   @id @default(autoincrement())
+  invoice     PurchaseInvoice       @relation(fields: [invoiceId], references: [id])
+  invoiceId   Int
+  returnDate  DateTime              @default(now())
+  reason      String?
+  total       Float
+  items       PurchaseReturnItem[]
+}
+
+model PurchaseReturnItem {
+  id          Int            @id @default(autoincrement())
+  purchaseReturn PurchaseReturn @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  returnId    Int
+  product     Product        @relation(fields: [productId], references: [id])
+  productId   Int
+  productName String
+  quantity    Float
+  unitPrice   Float
+  unitCost    Float
+  total       Float
 }
